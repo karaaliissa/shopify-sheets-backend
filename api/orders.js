@@ -1,5 +1,16 @@
 import { getAll } from "../lib/sheets.js";
 
+function allowCors(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*'); // or your Angular domain
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') {
+    res.status(200).end();
+    return true;
+  }
+  return false;
+}
+
 export default async function handler(req, res) {
   const shop = (req.query.shop || "").toLowerCase();
   const status = req.query.status || "";
