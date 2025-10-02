@@ -1,33 +1,13 @@
+// /pages/api/orders.js
 import { getAll } from "../lib/sheets.js";
-
-const ALLOWED_LIST = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
-
-function setCors(req, res) {
-  const origin = req.headers.origin || "";
-  if (ALLOWED_LIST.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin); // reflect the exact origin
-  }
-  // If you prefer to allow everything when no match:
-  // else res.setHeader("Access-Control-Allow-Origin", "*");
-
-  res.setHeader("Vary", "Origin"); // important with CDN
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Requested-With"
-  );
-  res.setHeader("Access-Control-Max-Age", "86400"); // cache preflight
-  res.setHeader("Cache-Control", "no-store");       // avoid stale headers being cached
-}
+import { setCors } from "../lib/cors.js";
 
 export default async function handler(req, res) {
   setCors(req, res);
 
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "GET")     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  if (req.method !== "GET")
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
 
   try {
     const shop   = (req.query.shop || "").toLowerCase();
