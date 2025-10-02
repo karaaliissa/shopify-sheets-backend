@@ -1,4 +1,7 @@
 import { getAll } from "../lib/sheets.js";
+import { setCors } from "../lib/cors.js";
+setCors(req, res);
+if (req.method === "OPTIONS") return res.status(204).end();
 const { TAB_LOGS = "TBL_WEBHOOK_LOG" } = process.env;
 
 export default async function handler(req, res) {
