@@ -11,16 +11,30 @@ export default async function handler(req, res) {
     const { runId, stopId, status, codAmount, notes } = req.body || {};
     if (!runId || !stopId || !status) return res.status(400).json({ ok:false, error:"runId, stopId, status required" });
 
-    // Append a light log row for history; you can also upsert in-place later.
+    // find last known stop row (so we keep columns like ORDER_ID, ADDRESS…)
+    const allStops = await getAll(Tabs.DRIVER_STOP);
+    const latest = allStops
+      .filter(s => s.RUN_ID === String(runId) && String(s.STOP_ID) === String(stopId))
+      .sort((a,b)=> new Date(b.DONE_AT || 0) - new Date(a.DONE_AT || 0))[0] || {};
+
     await appendObjects(Tabs.DRIVER_STOP, [{
-      RUN_ID: runId, STOP_ID: stopId, STATUS: status,
-      COD_AMOUNT: codAmount ?? "", NOTES: notes ?? "", DONE_AT: new Date().toISOString()
+      ...latest,
+      RUN_ID: String(runId),
+      STOP_ID: String(stopId),
+      STATUS: status,
+      COD_AMOUNT: codAmount ?? latest.COD_AMOUNT ?? "",
+      NOTES: (notes ?? latest.NOTES ?? ""),
+      DONE_AT: new Date().toISOString(),
     }]);
 
-    // optional: if delivered with COD, add a cash remittance seed row
     if (status === "delivered" && codAmount) {
       await appendObjects(Tabs.CASH, [{
-        RUN_ID: runId, DRIVER_ID: "", AMOUNT_COLLECTED: codAmount, HANDED_AT: "", RECEIVER: "", NOTES: ""
+        RUN_ID: String(runId),
+        DRIVER_ID: "", // optional: fill from TBL_DRIVER_RUN if you want
+        AMOUNT_COLLECTED: Number(codAmount),
+        HANDED_AT: "",
+        RECEIVER: "",
+        NOTES: ""
       }]);
     }
 

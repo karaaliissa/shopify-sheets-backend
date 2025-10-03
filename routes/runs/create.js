@@ -29,7 +29,7 @@ export default async function handler(req, res) {
         CUSTOMER_NAME: o.SHIP_NAME || "",
         ADDRESS: [o.SHIP_ADDRESS1, o.SHIP_CITY, o.SHIP_PROVINCE, o.SHIP_COUNTRY].filter(Boolean).join(", "),
         PHONE: o.SHIP_PHONE || o.CUSTOMER_EMAIL || "",
-        COD_AMOUNT: o.TOTAL || "",
+        COD_AMOUNT: Number(o.TOTAL || 0),
         STATUS: "assigned",
         ETA: "", DONE_AT: "", NOTES: ""
       };
