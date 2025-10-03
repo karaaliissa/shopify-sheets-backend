@@ -1,6 +1,6 @@
 // /pages/api/runs/for-driver.js
-import { setCors } from "../../lib/cors.js";
-import { getAll, Tabs } from "../../lib/sheets.js";
+import { setCors } from "../lib/cors.js";
+import { getAll, Tabs } from "../lib/sheets.js";
 
 export default async function handler(req, res) {
   setCors(req, res);
