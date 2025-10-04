@@ -1,6 +1,6 @@
-// api/export/shipday.js
-import { setCors } from "../lib/cors.js";
-import { getAll, Tabs } from "../lib/sheets.js";
+// /api/export/shipday.js
+import { setCors } from "../../lib/cors.js";      // <-- was ../lib (wrong)
+import { getAll, Tabs } from "../../lib/sheets.js"; // <-- was ../lib (wrong)
 
 const esc = (s='') => String(s).replace(/"/g,'""');
 const csv = rows => {
@@ -18,16 +18,13 @@ export default async function handler(req, res) {
     const shop = (req.query.shop || "").trim();
     const date = (req.query.date || new Date().toISOString().slice(0,10)).slice(0,10);
 
-    // pull today’s orders (adjust filter to your Sheet columns)
-    const orders = await getAll(Tabs.ORDERS); // TBL_ORDER
-    const items  = orders
-      .filter(o =>
-        (!shop || (o.SHOP_DOMAIN||'').trim() === shop) &&
-        (o.CREATED_AT || '').slice(0,10) <= date &&
-        ((o.STATUS || '').toLowerCase() === 'ready_dispatch' || (o.STATUS||'').toLowerCase()==='packed')
-      );
+    const orders = await getAll(Tabs.ORDERS);
+    const items  = orders.filter(o =>
+      (!shop || (o.SHOP_DOMAIN||'').trim() === shop) &&
+      (o.CREATED_AT || '').slice(0,10) <= date &&
+      (['ready_dispatch','packed'].includes((o.STATUS||'').toLowerCase()))
+    );
 
-    // Map to Shipday CSV columns (minimal set)
     const rows = items.map(o => ({
       orderNumber        : o.ORDER_NAME || o.ORDER_ID,
       customerName       : o.SHIP_NAME || o.CUSTOMER_NAME || '',
@@ -39,22 +36,21 @@ export default async function handler(req, res) {
       state              : o.SHIP_PROVINCE || '',
       postalCode         : o.SHIP_ZIP || '',
       country            : o.SHIP_COUNTRY || '',
-      // If you do cash collection:
       paymentMethod      : (o.COD_AMOUNT ? 'COD' : 'Prepaid'),
       codAmount          : o.COD_AMOUNT || '',
       note               : o.NOTE || '',
     }));
 
-    // no rows? still return a tiny CSV so user knows it worked
     const out = rows.length ? csv(rows) : 'orderNumber\n';
 
-    res.setHeader('Content-Type','text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="shipday-${date}.csv"`);
-    // in setCors() OR directly in /api/export/shipday handler before sending
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="shipday-${date}.csv"`);
+
+    // CORS + allow reading the filename header from Angular
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
-    res.setHeader("Access-Control-Expose-Headers", "Content-Disposition"); // <— important
+    res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
 
     return res.status(200).send(out);
   } catch (e) {
