@@ -1,6 +1,5 @@
-// /api/export/shipday.js
-import { setCors } from "../../lib/cors.js";      // <-- was ../lib (wrong)
-import { getAll, Tabs } from "../../lib/sheets.js"; // <-- was ../lib (wrong)
+import { setCors } from "../lib/cors.js";
+import { getAll, Tabs } from "../lib/sheets.js";
 
 const esc = (s='') => String(s).replace(/"/g,'""');
 const csv = rows => {
@@ -22,7 +21,7 @@ export default async function handler(req, res) {
     const items  = orders.filter(o =>
       (!shop || (o.SHOP_DOMAIN||'').trim() === shop) &&
       (o.CREATED_AT || '').slice(0,10) <= date &&
-      (['ready_dispatch','packed'].includes((o.STATUS||'').toLowerCase()))
+      ['ready_dispatch','packed'].includes((o.STATUS||'').toLowerCase())
     );
 
     const rows = items.map(o => ({
@@ -46,7 +45,7 @@ export default async function handler(req, res) {
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="shipday-${date}.csv"`);
 
-    // CORS + allow reading the filename header from Angular
+    // CORS + let the browser read filename
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
