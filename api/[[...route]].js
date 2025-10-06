@@ -413,38 +413,18 @@ export default async function router(req, res) {
   // Some runtimes don't populate req.query.route for catch-alls.
   // Fall back to parsing req.url.
   const segsFromQuery = Array.isArray(req.query.route) ? req.query.route : null;
-  let path = '';
-  if (segsFromQuery) {
-    path = segsFromQuery.map(s => String(s || '')).join('/');
-  } else {
-    const urlPath = (req.url || '').split('?')[0];      // e.g. /api/orders
-    path = urlPath.replace(/^\/api\/?/, '');            // -> "orders"
-  }
-  path = path.toLowerCase();
+  // ---- path detection (robust) ----
+let path = "";
+const p = req.query?.route;
+if (Array.isArray(p)) {
+  path = p.join("/").toLowerCase();
+} else if (typeof p === "string") {
+  path = p.toLowerCase();
+} else {
+  // Fallback when query param isn't populated by the runtime
+  const urlPath = (req.url || "").split("?")[0];   // e.g. /api/orders
+  // remove only the first /api prefix
+  path = urlPath.replace(/^\/api(\/|$)/, "").toLowerCase(); // => "orders" or ""
+}
 
-  try {
-    switch (path) {
-      case 'export/shipday':   return await handleShipday(req, res);
-      case 'shipday':          return await handleShipday(req, res);
-      case 'picking-list':     return await handlePickingListJson(req, res);
-      case 'orders':           return await handleOrders(req, res);
-      case 'items':            return await handleItems(req, res);
-      case 'order-items':      return await handleItems(req, res);
-      case 'logs':             return await handleLogs(req, res);
-      case 'runs/for-driver':  return await handleRunsForDriver(req, res);
-      case 'webhooks/shopify': return await handleWebhookShopify(req, res);
-      case 'print/picking':    return await handlePrintPickingHtml(req, res);
-      case 'work/start':       return await handleWorkStart(req, res);
-      case 'work/list':        return await handleWorkList(req, res);
-      case 'work/done':        return await handleWorkDone(req, res);
-      case '':                 return res.status(200).json({ ok:true, routes:[
-                                 'export/shipday','picking-list','orders','items','logs','runs/for-driver',
-                                 'webhooks/shopify','print/picking','work/start','work/list','work/done'
-                               ]});
-      default:
-        return res.status(404).json({ ok:false, error:`Unknown route /api/${path}` });
-    }
-  } catch (e) {
-    return res.status(500).json({ ok:false, error:String(e?.message || e) });
-  }
 }
