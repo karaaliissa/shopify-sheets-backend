@@ -1,4 +1,4 @@
-// pages/api/[...route].js
+// /api/[...route].js
 // Unified router (robust) — keeps everything in one file.
 
 import getRawBody from "raw-body";
@@ -12,7 +12,38 @@ import { verifyShopifyHmac, normalizeOrderPayload, enrichLineItemImages } from "
 import { getCache, setCache, invalidateByTag, k } from "./lib/cache.js";
 
 export const config = { api: { bodyParser: false }, runtime: "nodejs" }; // important on Vercel
+const inflight = new Map(); // key -> Promise resolving to payload
+const MIN_REFRESH_MS = 15_000; // ignore refresh spam inside this window
+const lastFetchAt = new Map(); // key -> ts
 
+async function withCache({ key, ttlMs, tags = [], refresh = false, fetcher }) {
+  // 1) serve fresh cache if not forcing refresh
+  const cached = getCache(key);
+  if (!refresh && cached) return cached;
+
+  // 2) rate-limit "refresh=1" spam: within window, still return cached (or in-flight)
+  if (refresh) {
+    const last = lastFetchAt.get(key) || 0;
+    if (Date.now() - last < MIN_REFRESH_MS && cached) return cached;
+  }
+
+  // 3) coalesce concurrent identical fetches
+  if (inflight.has(key)) return inflight.get(key);
+
+  const p = (async () => {
+    try {
+      const val = await fetcher();           // <-- the only place that hits Sheets
+      setCache(key, val, ttlMs, tags);
+      lastFetchAt.set(key, Date.now());
+      return val;
+    } finally {
+      inflight.delete(key);
+    }
+  })();
+
+  inflight.set(key, p);
+  return p;
+}
 // --- utils ------------------------------------------------------------------
 const esc = (s = "") => String(s)
   .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
@@ -48,30 +79,35 @@ async function handleOrders(req, res) {
   const shop    = (req.query.shop || "").toLowerCase();
   const status  = (req.query.status || "").toLowerCase();
   const limit   = Math.min(Number(req.query.limit || 100), 1000);
-  const refresh = String(req.query.refresh || "").toLowerCase() === "1"; // bypass cache if ?refresh=1
+  const refresh = String(req.query.refresh || "").toLowerCase() === "1";
 
   const key = k(["orders", shop, status, limit]);
-  if (!refresh) {
-    const cached = getCache(key);
-    if (cached) { setHttpCacheOk(res, 45); return res.status(200).json(cached); }
-  }
 
-  // stale-on-error: if Sheets fails, serve last cached
-  const previous = getCache(key);
   try {
-    const all = await getAll(process.env.TAB_ORDERS || "TBL_ORDER");
-    let rows = shop ? all.filter(r => (r.SHOP_DOMAIN || "").toLowerCase() === shop) : all;
-    if (status) rows = rows.filter(r => (r.FULFILLMENT_STATUS || "").toLowerCase() === status);
-    rows.sort((a,b) => (a.UPDATED_AT < b.UPDATED_AT ? 1 : -1));
-    const payload = { ok:true, items: rows.slice(0, limit) };
-    setCache(key, payload, 45_000, ["orders"]); // TTL 45s, tag "orders"
+    const payload = await withCache({
+      key,
+      ttlMs: 45_000,
+      tags: ["orders"],
+      refresh,
+      fetcher: async () => {
+        const all = await getAll(process.env.TAB_ORDERS || "TBL_ORDER");
+        let rows = shop ? all.filter(r => (r.SHOP_DOMAIN || "").toLowerCase() === shop) : all;
+        if (status) rows = rows.filter(r => (r.FULFILLMENT_STATUS || "").toLowerCase() === status);
+        rows.sort((a,b) => (a.UPDATED_AT < b.UPDATED_AT ? 1 : -1));
+        return { ok:true, items: rows.slice(0, limit) };
+      }
+    });
+
     setHttpCacheOk(res, 45);
     return res.status(200).json(payload);
   } catch (e) {
-    if (previous) { setHttpCacheOk(res, 45); return res.status(200).json(previous); }
-    return res.status(500).json({ ok:false, error:String(e?.message || e) });
+    // stale-on-error: if something still throws, give last cache or empty list
+    const fallback = getCache(key) || { ok:true, items: [] };
+    setHttpCacheOk(res, 15);
+    return res.status(200).json(fallback);
   }
 }
+
 
 async function handleItems(req, res) {
   if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
@@ -82,24 +118,28 @@ async function handleItems(req, res) {
   if (!shop || !orderId) return res.status(400).json({ ok:false, error:"Missing shop or order_id" });
 
   const key = k(["items", shop, orderId]);
-  if (!refresh) {
-    const cached = getCache(key);
-    if (cached) { setHttpCacheOk(res, 60); return res.status(200).json(cached); }
-  }
 
-  // stale-on-error
-  const previous = getCache(key);
   try {
-    const items = await getLatestItems(shop, orderId);
-    const payload = { ok:true, items };
-    setCache(key, payload, 60_000, [`items:${shop}`, `items:${shop}:${orderId}`]);
+    const payload = await withCache({
+      key,
+      ttlMs: 60_000,
+      tags: [`items:${shop}`, `items:${shop}:${orderId}`],
+      refresh,
+      fetcher: async () => {
+        const items = await getLatestItems(shop, orderId);
+        return { ok:true, items };
+      }
+    });
+
     setHttpCacheOk(res, 60);
     return res.status(200).json(payload);
   } catch (e) {
-    if (previous) { setHttpCacheOk(res, 60); return res.status(200).json(previous); }
-    return res.status(500).json({ ok:false, error:String(e?.message || e) });
+    const fallback = getCache(key) || { ok:true, items: [] };
+    setHttpCacheOk(res, 15);
+    return res.status(200).json(fallback);
   }
 }
+
 
 async function handleShipday(req, res) {
   if (req.method !== "GET") return res.status(405).send("Method Not Allowed");
