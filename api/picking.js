@@ -1,4 +1,4 @@
-// pages/api/print/picking.js
+// /api/picking.js
 import { getAll, Tabs } from "../lib/sheets.js";
 
 // tiny helpers duplicated to keep this file standalone
