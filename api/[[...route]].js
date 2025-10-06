@@ -200,86 +200,6 @@ async function handleShipday(req, res) {
   res.setHeader("Content-Disposition", `attachment; filename="shipday-${dateQ}.csv"`);
   return res.status(200).send(csv);
 }
-async function handlePickingListJson(req, res) {
-  if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
-  const shop = (req.query.shop || "").toLowerCase();
-  const fromIso = req.query.from ? new Date(req.query.from) : null;
-  const toIso   = req.query.to   ? new Date(req.query.to)   : null;
-
-  const orders = await getAll(Tabs.ORDERS);
-  const ordersFiltered = orders.filter(o => {
-    if (shop && (o.SHOP_DOMAIN || "").toLowerCase() !== shop) return false;
-    const t = new Date(o.CREATED_AT || o.UPDATED_AT || 0).getTime();
-    if (fromIso && t < fromIso.getTime()) return false;
-    if (toIso && t > toIso.getTime()) return false;
-    return true;
-  });
-
-  const orderIdSet = new Set(ordersFiltered.map(o => String(o.ORDER_ID)));
-  const orderNameById = new Map(
-    ordersFiltered.map(o => [String(o.ORDER_ID), o.ORDER_NAME || `#${o.ORDER_ID}`])
-  );
-  const shipMethodById = new Map(
-    ordersFiltered.map(o => [String(o.ORDER_ID), (o.SHIPPING_METHOD || "").toString()])
-  );
-
-  const itemsAll = await getAll(Tabs.ITEMS);
-  const itemsForOrders = itemsAll.filter(r =>
-    (!shop || (r.SHOP_DOMAIN || "").toLowerCase() === shop) && orderIdSet.has(String(r.ORDER_ID))
-  );
-
-  const latestBatchByOrder = new Map();
-  for (const it of itemsForOrders) {
-    const key = `${it.SHOP_DOMAIN}|${String(it.ORDER_ID)}`;
-    const ts = Number(it.BATCH_TS || 0);
-    if (!latestBatchByOrder.has(key) || ts > latestBatchByOrder.get(key)) latestBatchByOrder.set(key, ts);
-  }
-  const latestItems = itemsForOrders.filter(
-    it => Number(it.BATCH_TS || 0) === latestBatchByOrder.get(`${it.SHOP_DOMAIN}|${String(it.ORDER_ID)}`)
-  );
-
-  // Group by item key, but keep per-order express info
-  const byKey = new Map(); // key -> { …, ORDERS: Map<orderName, isExpress> }
-  for (const it of latestItems) {
-    const sku = (it.SKU || "").trim();
-    const k = sku || `${it.TITLE || ""}|${it.VARIANT_TITLE || ""}`;
-    const qty = Number(it.FULFILLABLE_QUANTITY ?? it.QUANTITY ?? 0);
-    const orderId = String(it.ORDER_ID);
-    const orderName = orderNameById.get(orderId) || `#${orderId}`;
-    const method = shipMethodById.get(orderId) || "";
-    const isExpress = /\bexpress\b/i.test(method);
-
-    if (!byKey.has(k)) {
-      byKey.set(k, {
-        KEY: k,
-        SKU: sku || "",
-        TITLE: it.TITLE || "",
-        VARIANT_TITLE: it.VARIANT_TITLE || "",
-        IMAGE: it.IMAGE || "",
-        TOTAL_QTY: 0,
-        ORDERS: new Map() // name -> boolean (isExpress)
-      });
-    }
-
-    const g = byKey.get(k);
-    g.TOTAL_QTY += qty;
-    g.IMAGE = g.IMAGE || it.IMAGE || "";
-    // if same order name appears multiple times, keep TRUE if any line is express
-    g.ORDERS.set(orderName, (g.ORDERS.get(orderName) || false) || isExpress);
-  }
-
-  const rows = Array.from(byKey.values())
-    .map(g => ({
-      ...g,
-      ORDERS: Array.from(g.ORDERS.entries()).map(([NAME, IS_EXPRESS]) => ({ NAME, IS_EXPRESS }))
-    }))
-    .filter(x => x.TOTAL_QTY > 0)
-    .sort((a, b) => b.TOTAL_QTY - a.TOTAL_QTY);
-
-  return res.status(200).json({ ok: true, items: rows });
-}
-
-
 // async function handlePickingListJson(req, res) {
 //   if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
 //   const shop = (req.query.shop || "").toLowerCase();
@@ -296,6 +216,13 @@ async function handlePickingListJson(req, res) {
 //   });
 
 //   const orderIdSet = new Set(ordersFiltered.map(o => String(o.ORDER_ID)));
+//   const orderNameById = new Map(
+//     ordersFiltered.map(o => [String(o.ORDER_ID), o.ORDER_NAME || `#${o.ORDER_ID}`])
+//   );
+//   const shipMethodById = new Map(
+//     ordersFiltered.map(o => [String(o.ORDER_ID), (o.SHIPPING_METHOD || "").toString()])
+//   );
+
 //   const itemsAll = await getAll(Tabs.ITEMS);
 //   const itemsForOrders = itemsAll.filter(r =>
 //     (!shop || (r.SHOP_DOMAIN || "").toLowerCase() === shop) && orderIdSet.has(String(r.ORDER_ID))
@@ -307,127 +234,146 @@ async function handlePickingListJson(req, res) {
 //     const ts = Number(it.BATCH_TS || 0);
 //     if (!latestBatchByOrder.has(key) || ts > latestBatchByOrder.get(key)) latestBatchByOrder.set(key, ts);
 //   }
-//   const latestItems = itemsForOrders.filter(it => Number(it.BATCH_TS || 0) === latestBatchByOrder.get(`${it.SHOP_DOMAIN}|${String(it.ORDER_ID)}`));
+//   const latestItems = itemsForOrders.filter(
+//     it => Number(it.BATCH_TS || 0) === latestBatchByOrder.get(`${it.SHOP_DOMAIN}|${String(it.ORDER_ID)}`)
+//   );
 
-//   const byKey = new Map();
-//   const orderNameById = new Map(ordersFiltered.map(o => [String(o.ORDER_ID), o.ORDER_NAME || `#${o.ORDER_ID}`]));
+//   // Group by item key, but keep per-order express info
+//   const byKey = new Map(); // key -> { …, ORDERS: Map<orderName, isExpress> }
 //   for (const it of latestItems) {
 //     const sku = (it.SKU || "").trim();
 //     const k = sku || `${it.TITLE || ""}|${it.VARIANT_TITLE || ""}`;
 //     const qty = Number(it.FULFILLABLE_QUANTITY ?? it.QUANTITY ?? 0);
-//     if (!byKey.has(k)) byKey.set(k, { KEY:k, SKU:sku || "", TITLE:it.TITLE || "", VARIANT_TITLE:it.VARIANT_TITLE || "", IMAGE:it.IMAGE || "", TOTAL_QTY:0, ORDERS:new Set() });
+//     const orderId = String(it.ORDER_ID);
+//     const orderName = orderNameById.get(orderId) || `#${orderId}`;
+//     const method = shipMethodById.get(orderId) || "";
+//     const isExpress = /\bexpress\b/i.test(method);
+
+//     if (!byKey.has(k)) {
+//       byKey.set(k, {
+//         KEY: k,
+//         SKU: sku || "",
+//         TITLE: it.TITLE || "",
+//         VARIANT_TITLE: it.VARIANT_TITLE || "",
+//         IMAGE: it.IMAGE || "",
+//         TOTAL_QTY: 0,
+//         ORDERS: new Map() // name -> boolean (isExpress)
+//       });
+//     }
+
 //     const g = byKey.get(k);
 //     g.TOTAL_QTY += qty;
 //     g.IMAGE = g.IMAGE || it.IMAGE || "";
-//     g.ORDERS.add(orderNameById.get(String(it.ORDER_ID)) || `#${it.ORDER_ID}`);
+//     // if same order name appears multiple times, keep TRUE if any line is express
+//     g.ORDERS.set(orderName, (g.ORDERS.get(orderName) || false) || isExpress);
 //   }
 
-//   const rows = Array.from(byKey.values()).map(g => ({ ...g, ORDERS: Array.from(g.ORDERS) }))
+//   const rows = Array.from(byKey.values())
+//     .map(g => ({
+//       ...g,
+//       ORDERS: Array.from(g.ORDERS.entries()).map(([NAME, IS_EXPRESS]) => ({ NAME, IS_EXPRESS }))
+//     }))
 //     .filter(x => x.TOTAL_QTY > 0)
-//     .sort((a,b) => b.TOTAL_QTY - a.TOTAL_QTY);
+//     .sort((a, b) => b.TOTAL_QTY - a.TOTAL_QTY);
 
-//   return res.status(200).json({ ok:true, items:rows });
+//   return res.status(200).json({ ok: true, items: rows });
 // }
-// --- PRINT: Picking (HTML) ---------------------------------------------------
-// async function handlePrintPicking(req, res) {
-//   if (req.method !== "GET") return res.status(405).send("Method Not Allowed");
+async function handlePickingListJson(req, res) {
+  if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
+  const shop = (req.query.shop || "").toLowerCase();
+  const fromIso = req.query.from ? new Date(req.query.from) : null;
+  const toIso   = req.query.to   ? new Date(req.query.to)   : null;
 
-//   const shop = (req.query.shop || "").toLowerCase().trim();
-//   const q    = (req.query.q || "").toLowerCase().trim();
+  const orders = await getAll(Tabs.ORDERS);
+  const ordersFiltered = orders.filter(o => {
+    if (shop && (o.SHOP_DOMAIN || "").toLowerCase() !== shop) return false;
+    const t = new Date(o.CREATED_AT || o.UPDATED_AT || 0).getTime();
+    if (fromIso && t < fromIso.getTime()) return false;
+    if (toIso && t > toIso.getTime()) return false;
+    return true;
+  });
 
-//   // reuse same grouping logic as handlePickingListJson
-//   const orders = await getAll(Tabs.ORDERS);
-//   const orderIdSet = new Set(
-//     orders.filter(o => !shop || (o.SHOP_DOMAIN || "").toLowerCase() === shop)
-//           .map(o => String(o.ORDER_ID))
-//   );
+  const orderIdSet = new Set(ordersFiltered.map(o => String(o.ORDER_ID)));
+  const orderById = new Map(ordersFiltered.map(o => [String(o.ORDER_ID), o]));
+  const orderNameById = new Map(
+    ordersFiltered.map(o => [String(o.ORDER_ID), o.ORDER_NAME || `#${o.ORDER_ID}`])
+  );
 
-//   const itemsAll = await getAll(Tabs.ITEMS);
-//   const itemsForOrders = itemsAll.filter(r =>
-//     (!shop || (r.SHOP_DOMAIN || "").toLowerCase() === shop) &&
-//     orderIdSet.has(String(r.ORDER_ID))
-//   );
+  const itemsAll = await getAll(Tabs.ITEMS);
+  const itemsForOrders = itemsAll.filter(r =>
+    (!shop || (r.SHOP_DOMAIN || "").toLowerCase() === shop) && orderIdSet.has(String(r.ORDER_ID))
+  );
 
-//   // keep latest batch per (shop,order)
-//   const last = new Map();
-//   for (const it of itemsForOrders) {
-//     const key = `${(it.SHOP_DOMAIN||"").toLowerCase()}|${String(it.ORDER_ID)}`;
-//     const ts  = Number(it.BATCH_TS || 0);
-//     if (!last.has(key) || ts > last.get(key)) last.set(key, ts);
-//   }
-//   const latest = itemsForOrders.filter(it =>
-//     Number(it.BATCH_TS || 0) === last.get(`${(it.SHOP_DOMAIN||"").toLowerCase()}|${String(it.ORDER_ID)}`)
-//   );
+  // keep only latest batch per order
+  const latestBatchByOrder = new Map();
+  for (const it of itemsForOrders) {
+    const key = `${it.SHOP_DOMAIN}|${String(it.ORDER_ID)}`;
+    const ts = Number(it.BATCH_TS || 0);
+    if (!latestBatchByOrder.has(key) || ts > latestBatchByOrder.get(key)) latestBatchByOrder.set(key, ts);
+  }
+  const latestItems = itemsForOrders.filter(
+    it => Number(it.BATCH_TS || 0) === latestBatchByOrder.get(`${it.SHOP_DOMAIN}|${String(it.ORDER_ID)}`)
+  );
 
-//   const orderNameById = new Map(orders.map(o => [String(o.ORDER_ID), o.ORDER_NAME || `#${o.ORDER_ID}`]));
-//   const byKey = new Map();
-//   for (const it of latest) {
-//     const sku = (it.SKU || "").trim();
-//     const key = sku || `${it.TITLE || ""}|${it.VARIANT_TITLE || ""}`;
-//     const qty = Number(it.FULFILLABLE_QUANTITY ?? it.QUANTITY ?? 0);
-//     if (!byKey.has(key)) byKey.set(key, {
-//       KEY:key, SKU:sku || "", TITLE:it.TITLE || "", VARIANT_TITLE:it.VARIANT_TITLE || "",
-//       IMAGE:it.IMAGE || "", TOTAL_QTY:0, ORDERS:new Set()
-//     });
-//     const g = byKey.get(key);
-//     g.TOTAL_QTY += qty;
-//     g.IMAGE = g.IMAGE || it.IMAGE || "";
-//     g.ORDERS.add(orderNameById.get(String(it.ORDER_ID)) || `#${it.ORDER_ID}`);
-//   }
+  // group by item key, but store per-order flags
+  const byKey = new Map(); // key -> { ..., ORDERS: Map<orderName, {IS_EXPRESS, IS_OLD, DATE}> }
+  const now = Date.now();
 
-//   let rows = Array.from(byKey.values()).map(g => ({...g, ORDERS:Array.from(g.ORDERS)}))
-//                  .filter(x => x.TOTAL_QTY > 0)
-//                  .sort((a,b) => b.TOTAL_QTY - a.TOTAL_QTY);
+  for (const it of latestItems) {
+    const sku = (it.SKU || "").trim();
+    const k = sku || `${it.TITLE || ""}|${it.VARIANT_TITLE || ""}`;
+    const qty = Number(it.FULFILLABLE_QUANTITY ?? it.QUANTITY ?? 0);
 
-//   if (q) {
-//     rows = rows.filter(x =>
-//       (x.SKU||"").toLowerCase().includes(q) ||
-//       (x.TITLE||"").toLowerCase().includes(q) ||
-//       (x.VARIANT_TITLE||"").toLowerCase().includes(q)
-//     );
-//   }
+    const orderId = String(it.ORDER_ID);
+    const ord = orderById.get(orderId) || {};
+    const orderName = orderNameById.get(orderId) || `#${orderId}`;
 
-//   // tiny HTML printable page
-//   const html = `<!doctype html><html><head>
-//   <meta charset="utf-8"/>
-//   <title>Picking – ${esc(shop)}</title>
-//   <style>
-//     *{box-sizing:border-box} body{font:14px/1.35 system-ui,Segoe UI,Roboto,Arial;padding:16px}
-//     .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
-//     .card{border:1px solid #e5e7eb;border-radius:12px;padding:12px;display:flex;gap:10px}
-//     img{width:72px;height:72px;object-fit:cover;border-radius:8px;border:1px solid #eee}
-//     .title{font-weight:600;margin-bottom:4px}
-//     .sku{font-size:12px;color:#6b7280;margin-right:6px}
-//     .variant{font-size:12px;color:#6b7280;margin-left:6px}
-//     .qty{margin:6px 0;font-size:15px}
-//     .tag{display:inline-block;background:#f3f4f6;border:1px solid #e5e7eb;border-radius:999px;
-//          padding:2px 8px;margin:2px;font-size:12px}
-//     .top{display:flex;justify-content:space-between;align-items:center;margin:0 0 12px}
-//     .muted{color:#6b7280}
-//     @media print{ .no-print{display:none} body{padding:0} .card{break-inside:avoid} }
-//   </style></head><body>
-//     <div class="top no-print">
-//       <div><strong>Picking List</strong> — Shop: ${esc(shop || "all")} — Items: ${rows.length}</div>
-//       <button onclick="window.print()">Print</button>
-//     </div>
-//     <div class="grid">
-//       ${rows.map(r => `
-//         <div class="card">
-//           ${r.IMAGE ? `<img src="${esc(r.IMAGE)}" onerror="this.style.display='none'">` : ""}
-//           <div class="info">
-//             <div class="title"><span class="sku">${esc(r.SKU)}</span>${esc(r.TITLE)}${r.VARIANT_TITLE ? ` <span class="variant">(${esc(r.VARIANT_TITLE)})</span>` : ""}</div>
-//             <div class="qty">Qty: <strong>${r.TOTAL_QTY}</strong></div>
-//             <div class="orders">${r.ORDERS.map(o => `<span class="tag">${esc(o)}</span>`).join("")}</div>
-//           </div>
-//         </div>`).join("")}
-//     </div>
-//     <div class="muted no-print" style="margin-top:16px">Generated at ${new Date().toLocaleString()}</div>
-//   </body></html>`;
+    const shippingMethod = (ord.SHIPPING_METHOD || "").toString();
+    const isExpress = /\bexpress\b/i.test(shippingMethod);
 
-//   setHttpCacheOk(res, 30); // allow CDN caching briefly
-//   res.setHeader("Content-Type","text/html; charset=utf-8");
-//   res.status(200).send(html);
-// }
+    const created = new Date(ord.CREATED_AT || ord.UPDATED_AT || 0);
+    const ageDays = Math.floor((now - created.getTime()) / 86400000);
+    const tags = (ord.TAGS || "").toString();
+    const shipped = /\bshipped\b/i.test(tags);
+    const isOld = ageDays > 7 && !shipped;
+
+    if (!byKey.has(k)) {
+      byKey.set(k, {
+        KEY: k,
+        SKU: sku || "",
+        TITLE: it.TITLE || "",
+        VARIANT_TITLE: it.VARIANT_TITLE || "",
+        IMAGE: it.IMAGE || "",
+        TOTAL_QTY: 0,
+        ORDERS: new Map()
+      });
+    }
+
+    const g = byKey.get(k);
+    g.TOTAL_QTY += qty;
+    g.IMAGE = g.IMAGE || it.IMAGE || "";
+
+    const prev = g.ORDERS.get(orderName) || { IS_EXPRESS: false, IS_OLD: false, DATE: created.toISOString() };
+    g.ORDERS.set(orderName, {
+      NAME: orderName,
+      IS_EXPRESS: prev.IS_EXPRESS || isExpress,
+      IS_OLD: prev.IS_OLD || isOld,
+      DATE: created.toISOString()
+    });
+  }
+
+  const rows = Array.from(byKey.values())
+    .map(g => ({
+      ...g,
+      ORDERS: Array.from(g.ORDERS.values()) // to array of {NAME, IS_EXPRESS, IS_OLD, DATE}
+    }))
+    .filter(x => x.TOTAL_QTY > 0)
+    .sort((a, b) => b.TOTAL_QTY - a.TOTAL_QTY);
+
+  return res.status(200).json({ ok: true, items: rows });
+}
+
+
 
 async function handleWebhookShopify(req, res) {
   if (req.method !== "POST") { res.setHeader("Allow","POST"); return res.status(405).json({ ok:false, error:"Method Not Allowed" }); }
