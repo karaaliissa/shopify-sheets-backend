@@ -215,7 +215,6 @@ async function handlePickingListJson(req, res) {
     return true;
   });
 
-  // maps to use during grouping
   const orderIdSet = new Set(ordersFiltered.map(o => String(o.ORDER_ID)));
   const orderNameById = new Map(
     ordersFiltered.map(o => [String(o.ORDER_ID), o.ORDER_NAME || `#${o.ORDER_ID}`])
@@ -239,11 +238,16 @@ async function handlePickingListJson(req, res) {
     it => Number(it.BATCH_TS || 0) === latestBatchByOrder.get(`${it.SHOP_DOMAIN}|${String(it.ORDER_ID)}`)
   );
 
-  const byKey = new Map();
+  // Group by item key, but keep per-order express info
+  const byKey = new Map(); // key -> { …, ORDERS: Map<orderName, isExpress> }
   for (const it of latestItems) {
     const sku = (it.SKU || "").trim();
     const k = sku || `${it.TITLE || ""}|${it.VARIANT_TITLE || ""}`;
     const qty = Number(it.FULFILLABLE_QUANTITY ?? it.QUANTITY ?? 0);
+    const orderId = String(it.ORDER_ID);
+    const orderName = orderNameById.get(orderId) || `#${orderId}`;
+    const method = shipMethodById.get(orderId) || "";
+    const isExpress = /\bexpress\b/i.test(method);
 
     if (!byKey.has(k)) {
       byKey.set(k, {
@@ -253,27 +257,28 @@ async function handlePickingListJson(req, res) {
         VARIANT_TITLE: it.VARIANT_TITLE || "",
         IMAGE: it.IMAGE || "",
         TOTAL_QTY: 0,
-        ORDERS: new Set(),
-        HAS_EXPRESS: false
+        ORDERS: new Map() // name -> boolean (isExpress)
       });
     }
 
     const g = byKey.get(k);
     g.TOTAL_QTY += qty;
     g.IMAGE = g.IMAGE || it.IMAGE || "";
-    g.ORDERS.add(orderNameById.get(String(it.ORDER_ID)) || `#${it.ORDER_ID}`);
-
-    const method = shipMethodById.get(String(it.ORDER_ID)) || "";
-    if (/\bexpress\b/i.test(method)) g.HAS_EXPRESS = true; // mark if any order in the group is Express
+    // if same order name appears multiple times, keep TRUE if any line is express
+    g.ORDERS.set(orderName, (g.ORDERS.get(orderName) || false) || isExpress);
   }
 
   const rows = Array.from(byKey.values())
-    .map(g => ({ ...g, ORDERS: Array.from(g.ORDERS) }))
+    .map(g => ({
+      ...g,
+      ORDERS: Array.from(g.ORDERS.entries()).map(([NAME, IS_EXPRESS]) => ({ NAME, IS_EXPRESS }))
+    }))
     .filter(x => x.TOTAL_QTY > 0)
     .sort((a, b) => b.TOTAL_QTY - a.TOTAL_QTY);
 
   return res.status(200).json({ ok: true, items: rows });
 }
+
 
 // async function handlePickingListJson(req, res) {
 //   if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
