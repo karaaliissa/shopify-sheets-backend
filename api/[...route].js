@@ -417,9 +417,11 @@ export default async function router(req, res) {
     switch (path) {
       // existing
       case 'export/shipday':        return await handleShipday(req, res);
+      case 'shipday':               return await handleShipday(req, res);
       case 'picking-list':          return await handlePickingListJson(req, res);
       case 'orders':                return await handleOrders(req, res);
       case 'items':                 return await handleItems(req, res);
+      case 'order-items':           return await handleItems(req, res);
       case 'logs':                  return await handleLogs(req, res);
       case 'runs/for-driver':       return await handleRunsForDriver(req, res);
       case 'webhooks/shopify':      return await handleWebhookShopify(req, res);

@@ -1,8 +1,8 @@
 // /pages/api/webhooks/shopify.js
 import getRawBody from "raw-body";
 import crypto from "crypto";
-import { verifyShopifyHmac, normalizeOrderPayload, enrichLineItemImages } from "../../lib/shopify.js";
-import { upsertOrder, writeLineItems, logWebhook } from "../../lib/sheets.js";
+import { verifyShopifyHmac, normalizeOrderPayload, enrichLineItemImages } from "../lib/shopify.js";
+import { upsertOrder, writeLineItems, logWebhook } from "../lib/sheets.js";
 
 const {
   SHOPIFY_WEBHOOK_SECRET,
