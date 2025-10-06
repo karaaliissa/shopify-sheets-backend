@@ -1,4 +1,4 @@
-// /pages/api/webhooks/shopify.js
+// /api/webhooks/shopify.js
 import getRawBody from "raw-body";
 import crypto from "crypto";
 import { verifyShopifyHmac, normalizeOrderPayload, enrichLineItemImages } from "../lib/shopify.js";
