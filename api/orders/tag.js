@@ -1,8 +1,8 @@
 // api/orders/tag.js
-import { setCors } from '../api/lib/cors.js';
-import { getOrder, setOrderTags, normalizeOrderPayload } from '../api/lib/shopify.js';
-import { upsertOrder } from '../api/lib/sheets.js';
-import { invalidateByTag } from '../api/lib/cache.js';
+import { setCors } from '../lib/cors.js';
+import { getOrder, setOrderTags, normalizeOrderPayload } from '../lib/shopify.js';
+import { upsertOrder } from '../lib/sheets.js';
+import { invalidateByTag } from '../lib/cache.js';
 
 export const config = { api: { bodyParser: true }, runtime: 'nodejs' };
 
