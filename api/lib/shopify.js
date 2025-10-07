@@ -20,8 +20,10 @@ export function normalizeOrderPayload(payload, shopDomain) {
   const codes = Array.isArray(o.discount_codes)
     ? o.discount_codes.map(d => d?.code).filter(Boolean)
     : [];
-
-  const order = {
+    
+    const noteAttrsJson = JSON.stringify(o.note_attributes ?? []);
+  
+    const order = {
     SHOP_DOMAIN: shopDomain,
     ORDER_ID: String(o.id ?? ""),
     ORDER_NAME: o.name ?? "",
@@ -51,6 +53,7 @@ export function normalizeOrderPayload(payload, shopDomain) {
 
     // NEW: for your extra columns
     NOTE: (o.note ?? "")?.toString(),                 // customer note
+    NOTE_ATTRIBUTES: noteAttrsJson,
     SOURCE_NAME: (o.source_name ?? "")?.toString(),   // 'web', 'pos', 'shopify_draft_order', ...
     DISCOUNT_CODES: codes.join(","),                  // "WELCOME10,VIP15"
   };
@@ -76,6 +79,7 @@ export function normalizeOrderPayload(payload, shopDomain) {
       UNIT_PRICE: unit,                  // NEW
       LINE_TOTAL: unit * qty,            // NEW
       CURRENCY: currency,                // NEW
+      PROPERTIES_JSON: JSON.stringify(li.properties ?? []),
     };
   });
 
