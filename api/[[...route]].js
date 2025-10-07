@@ -519,13 +519,16 @@ async function handleOrderTag(req, res) {
     }
 
     // 2) Write back to Shopify
-    const updated = await setOrderTags(shop, orderId, nextTags, SHOPIFY_ADMIN_TOKEN);
+    // const updated = await setOrderTags(shop, orderId, nextTags, SHOPIFY_ADMIN_TOKEN);
 
     // 3) Normalize + upsert to Sheets so UI reflects immediately (no webhook wait)
     const { normalizeOrderPayload } = await import("./lib/shopify.js");
     const { upsertOrder } = await import("./lib/sheets.js");
 
-    const { order } = normalizeOrderPayload(updated, shop);
+    // const { order } = normalizeOrderPayload(updated, shop);
+    
+    order.TAGS = nextTags.join(', ');
+    order.UPDATED_AT = new Date().toISOString();
     await upsertOrder(order);
 
     // 4) Bust caches

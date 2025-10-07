@@ -80,10 +80,16 @@ export async function upsertOrder(orderObj) {
     const current = all[idx];
     const incoming = new Date(orderObj.UPDATED_AT || 0).getTime() || 0;
     const existing = new Date(current.UPDATED_AT || 0).getTime() || 0;
-
-    if (incoming <= existing) {
-      return { action: "skipped-older-or-equal" };
-    }
+        const tagsChanged =
+          String(current.TAGS ?? '') !== String(orderObj.TAGS ?? '');
+  
+        if (incoming <= existing) {
+          return { action: "skipped-older-or-equal" };
+        }
+        // If Shopify timestamp didn't move but tags changed, still update.
+        if (incoming <= existing && !tagsChanged) {
+          return { action: "skipped-older-or-equal" };
+        }
 
     const row = objToRow(headers, { ...current, ...orderObj });
     const rowNumber = idx + 2; // +1 header, +1 index
