@@ -1,24 +1,25 @@
 import crypto from "crypto";
 
-// --- HMAC -------------------------------------------------------------------
+// --- HMAC --------------------------------------------------------------
 export function verifyShopifyHmac(rawBodyBuffer, secret, headerHmac) {
   if (!secret || !headerHmac) return false;
-  const digest = crypto
-    .createHmac("sha256", secret)
-    .update(rawBodyBuffer, "utf8")
-    .digest("base64");
-  try {
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(headerHmac));
-  } catch {
-    return false;
-  }
+  const digest = crypto.createHmac("sha256", secret).update(rawBodyBuffer, "utf8").digest("base64");
+  try { return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(headerHmac)); }
+  catch { return false; }
 }
 
-// --- Normalization (Order + Line Items) -------------------------------------
+// --- Normalization (Order + Line Items) --------------------------------
 export function normalizeOrderPayload(payload, shopDomain) {
   const o = payload || {};
   const addr = o.shipping_address || {};
   const shippingLine = (o.shipping_lines && o.shipping_lines[0]) || {};
+
+  // Discount code(s)
+  // Shopify sends either `discount_codes` (array of {code, amount, type})
+  // and/or `discount_applications` (automatic/app discounts). We expose a CSV of codes.
+  const codes = Array.isArray(o.discount_codes)
+    ? o.discount_codes.map(d => d?.code).filter(Boolean)
+    : [];
 
   const order = {
     SHOP_DOMAIN: shopDomain,
@@ -29,12 +30,11 @@ export function normalizeOrderPayload(payload, shopDomain) {
     CANCELLED_AT: o.cancelled_at ?? "",
     FULFILLMENT_STATUS: o.fulfillment_status ?? "",
 
-    // Extra fields you’re showing on the board
     FINANCIAL_STATUS: o.financial_status ?? "",
     PAYMENT_GATEWAY: (o.payment_gateway_names?.[0] ?? ""),
     SHIPPING_METHOD: shippingLine.title ?? "",
 
-    // Ship-to (flattened)
+    // Ship-to
     SHIP_NAME: [addr.first_name, addr.last_name].filter(Boolean).join(" "),
     SHIP_ADDRESS1: addr.address1 ?? "",
     SHIP_ADDRESS2: addr.address2 ?? "",
@@ -47,16 +47,19 @@ export function normalizeOrderPayload(payload, shopDomain) {
     TAGS: (o.tags ?? "")?.toString(),
     TOTAL: o.total_price ?? "",
     CURRENCY: o.currency ?? "",
-    CUSTOMER_EMAIL: o?.email ?? o?.customer?.email ?? ""
+    CUSTOMER_EMAIL: o?.email ?? o?.customer?.email ?? "",
+
+    // NEW: for your extra columns
+    NOTE: (o.note ?? "")?.toString(),                 // customer note
+    SOURCE_NAME: (o.source_name ?? "")?.toString(),   // 'web', 'pos', 'shopify_draft_order', ...
+    DISCOUNT_CODES: codes.join(","),                  // "WELCOME10,VIP15"
   };
 
-  // Include per-line unit price, line total and currency for your Products column
+  // Prefer money from price_set (handles multi-currency)
   const lineItems = (o.line_items || []).map(li => {
-    const unit = Number(
-      (li.price_set?.shop_money?.amount ?? li.price ?? 0)
-    );
-    const currency =
-      li.price_set?.shop_money?.currency_code ?? o.currency ?? "";
+    const unit = Number(li.price_set?.shop_money?.amount ?? li.price ?? 0);
+    const currency = li.price_set?.shop_money?.currency_code ?? o.currency ?? "";
+    const qty = Number(li.quantity ?? 0);
 
     return {
       SHOP_DOMAIN: shopDomain,
@@ -64,17 +67,15 @@ export function normalizeOrderPayload(payload, shopDomain) {
       LINE_ID: String(li.id ?? ""),
       TITLE: li.title ?? "",
       VARIANT_TITLE: li.variant_title ?? "",
-      QUANTITY: Number(li.quantity ?? 0),
+      QUANTITY: qty,
       FULFILLABLE_QUANTITY: Number(li.fulfillable_quantity ?? li.quantity ?? 0),
       SKU: li.sku ?? "",
-      IMAGE:
-        li?.image?.src ??
-        (li?.properties?.find?.(p => p.name === "_image")?.value ?? ""),
+      IMAGE: li?.image?.src ?? (li?.properties?.find?.(p => p.name === "_image")?.value ?? ""),
       PRODUCT_ID: String(li.product_id ?? ""),
       VARIANT_ID: String(li.variant_id ?? ""),
-      UNIT_PRICE: unit,
-      LINE_TOTAL: unit * Number(li.quantity ?? 0),
-      CURRENCY: currency,
+      UNIT_PRICE: unit,                  // NEW
+      LINE_TOTAL: unit * qty,            // NEW
+      CURRENCY: currency,                // NEW
     };
   });
 
@@ -90,7 +91,7 @@ async function shopifyGetJson(shopDomain, path, adminToken) {
 }
 
 export async function enrichLineItemImages(shopDomain, items, adminToken) {
-  if (!adminToken) return items; // nothing to do
+  if (!adminToken) return items;
 
   const byProduct = new Map();
   for (const it of items) {
