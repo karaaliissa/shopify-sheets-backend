@@ -117,3 +117,33 @@ export async function enrichLineItemImages(shopDomain, items, adminToken) {
   }
   return items;
 }
+async function shopifyPutJson(shopDomain, path, adminToken, body) {
+  const url = `https://${shopDomain}/admin/api/2024-07${path}`;
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      'X-Shopify-Access-Token': adminToken,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) throw new Error(`Shopify ${res.status} ${path}: ${await res.text()}`);
+  return res.json();
+}
+
+export async function getOrder(shopDomain, orderId, adminToken) {
+  const { order } = await shopifyGetJson(shopDomain, `/orders/${orderId}.json`, adminToken);
+  return order;
+}
+
+export async function setOrderTags(shopDomain, orderId, tagsArray, adminToken) {
+  const tags = (tagsArray || []).filter(Boolean).join(', ');
+  // Shopify requires the full tags string; this overwrites existing tags
+  const { order } = await shopifyPutJson(
+    shopDomain,
+    `/orders/${orderId}.json`,
+    adminToken,
+    { order: { id: Number(orderId), tags } }
+  );
+  return order; // updated order
+}
