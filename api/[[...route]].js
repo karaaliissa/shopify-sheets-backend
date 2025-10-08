@@ -73,8 +73,44 @@ function setHttpCacheOk(res, seconds = 30) {
 
 // --- HANDLERS ---------------------------------------------------------------
 
+// async function handleOrders(req, res) {
+//   if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
+
+//   const shop    = (req.query.shop || "").toLowerCase();
+//   const status  = (req.query.status || "").toLowerCase();
+//   const limit   = Math.min(Number(req.query.limit || 100), 1000);
+//   const refresh = String(req.query.refresh || "").toLowerCase() === "1";
+
+//   const key = k(["orders", shop, status, limit]);
+
+//   try {
+//     const payload = await withCache({
+//       key,
+//       ttlMs: 45_000,
+//       tags: ["orders"],
+//       refresh,
+//       fetcher: async () => {
+//         const all = await getAll(process.env.TAB_ORDERS || "TBL_ORDER");
+//         let rows = shop ? all.filter(r => (r.SHOP_DOMAIN || "").toLowerCase() === shop) : all;
+//         if (status) rows = rows.filter(r => (r.FULFILLMENT_STATUS || "").toLowerCase() === status);
+//         rows.sort((a,b) => (a.UPDATED_AT < b.UPDATED_AT ? 1 : -1));
+//         return { ok:true, items: rows.slice(0, limit) };
+//       }
+//     });
+
+//     setHttpCacheOk(res, 45);
+//     return res.status(200).json(payload);
+//   } catch (e) {
+//     // stale-on-error: if something still throws, give last cache or empty list
+//     const fallback = getCache(key) || { ok:true, items: [] };
+//     setHttpCacheOk(res, 15);
+//     return res.status(200).json(fallback);
+//   }
+// }
 async function handleOrders(req, res) {
-  if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
+  if (req.method !== "GET") {
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  }
 
   const shop    = (req.query.shop || "").toLowerCase();
   const status  = (req.query.status || "").toLowerCase();
@@ -83,26 +119,28 @@ async function handleOrders(req, res) {
 
   const key = k(["orders", shop, status, limit]);
 
-  try {
-    const payload = await withCache({
-      key,
-      ttlMs: 45_000,
-      tags: ["orders"],
-      refresh,
-      fetcher: async () => {
-        const all = await getAll(process.env.TAB_ORDERS || "TBL_ORDER");
-        let rows = shop ? all.filter(r => (r.SHOP_DOMAIN || "").toLowerCase() === shop) : all;
-        if (status) rows = rows.filter(r => (r.FULFILLMENT_STATUS || "").toLowerCase() === status);
-        rows.sort((a,b) => (a.UPDATED_AT < b.UPDATED_AT ? 1 : -1));
-        return { ok:true, items: rows.slice(0, limit) };
-      }
-    });
+  const fetcher = async () => {
+    const all = await getAll(process.env.TAB_ORDERS || "TBL_ORDER");
+    let rows = shop ? all.filter(r => (r.SHOP_DOMAIN || "").toLowerCase() === shop) : all;
+    if (status) rows = rows.filter(r => (r.FULFILLMENT_STATUS || "").toLowerCase() === status);
+    rows.sort((a, b) => (a.UPDATED_AT < b.UPDATED_AT ? 1 : -1));
+    return { ok: true, items: rows.slice(0, limit) };
+  };
 
-    setHttpCacheOk(res, 45);
+  try {
+    const payload = refresh
+      ? await fetcher() // hard bypass memory cache
+      : await withCache({ key, ttlMs: 45_000, tags: ["orders"], fetcher });
+
+    if (refresh) {
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    } else {
+      setHttpCacheOk(res, 45); // public, s-maxage=45
+    }
+
     return res.status(200).json(payload);
-  } catch (e) {
-    // stale-on-error: if something still throws, give last cache or empty list
-    const fallback = getCache(key) || { ok:true, items: [] };
+  } catch {
+    const fallback = getCache(key) || { ok: true, items: [] };
     setHttpCacheOk(res, 15);
     return res.status(200).json(fallback);
   }
