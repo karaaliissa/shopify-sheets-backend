@@ -483,59 +483,118 @@ export default async function main(req, res) {
   try { await handler(req, res); }
   catch (e) { res.status(500).json({ ok:false, error:String(e?.message || e) }); }
 }
+// async function handleOrderTag(req, res) {
+//   if (req.method !== "POST") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
+
+//   const { SHOPIFY_ADMIN_TOKEN } = process.env;
+//   if (!SHOPIFY_ADMIN_TOKEN) return res.status(500).json({ ok:false, error:"Missing SHOPIFY_ADMIN_TOKEN" });
+
+//   const body = await readJsonBody(req);
+//   const shop = String(body.shop || "").toLowerCase();
+//   const orderId = String(body.orderId || "");
+//   const action = String(body.action || "add").toLowerCase();  // add | remove | set
+//   let tag = String(body.tag || "").trim();
+//   let tags = Array.isArray(body.tags) ? body.tags.map(s => String(s).trim()).filter(Boolean) : null;
+
+//   if (!shop || !orderId) return res.status(400).json({ ok:false, error:"Missing shop or orderId" });
+//   if (action !== "set" && !tag) return res.status(400).json({ ok:false, error:"Missing tag" });
+
+//   try {
+//     // 1) Read current order from Shopify to get existing tags
+//     const { getOrder, setOrderTags } = await import("./lib/shopify.js");
+//     const cur = await getOrder(shop, orderId, SHOPIFY_ADMIN_TOKEN);
+//     const currentTags = (cur?.tags || "")
+//       .split(",")
+//       .map(s => s.trim())
+//       .filter(Boolean);
+
+//     let nextTags = currentTags;
+
+//     if (action === "add") {
+//       if (!currentTags.includes(tag)) nextTags = [...currentTags, tag];
+//     } else if (action === "remove") {
+//       nextTags = currentTags.filter(t => t.toLowerCase() !== tag.toLowerCase());
+//     } else if (action === "set") {
+//       nextTags = (tags || []);
+//     }
+
+//     // 2) Write back to Shopify
+//     // const updated = await setOrderTags(shop, orderId, nextTags, SHOPIFY_ADMIN_TOKEN);
+
+//     // 3) Normalize + upsert to Sheets so UI reflects immediately (no webhook wait)
+//     const { normalizeOrderPayload } = await import("./lib/shopify.js");
+//     const { upsertOrder } = await import("./lib/sheets.js");
+
+//     // const { order } = normalizeOrderPayload(updated, shop);
+    
+//     order.TAGS = nextTags.join(', ');
+//     order.UPDATED_AT = new Date().toISOString();
+//     await upsertOrder(order);
+
+//     // 4) Bust caches
+//     try { invalidateByTag("orders"); } catch {}
+
+//     return res.status(200).json({ ok:true, tags: nextTags });
+//   } catch (e) {
+//     return res.status(500).json({ ok:false, error: e?.message || String(e) });
+//   }
+// }
 async function handleOrderTag(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  }
 
   const { SHOPIFY_ADMIN_TOKEN } = process.env;
-  if (!SHOPIFY_ADMIN_TOKEN) return res.status(500).json({ ok:false, error:"Missing SHOPIFY_ADMIN_TOKEN" });
+  if (!SHOPIFY_ADMIN_TOKEN) {
+    return res.status(500).json({ ok: false, error: "Missing SHOPIFY_ADMIN_TOKEN" });
+  }
 
   const body = await readJsonBody(req);
   const shop = String(body.shop || "").toLowerCase();
   const orderId = String(body.orderId || "");
-  const action = String(body.action || "add").toLowerCase();  // add | remove | set
-  let tag = String(body.tag || "").trim();
-  let tags = Array.isArray(body.tags) ? body.tags.map(s => String(s).trim()).filter(Boolean) : null;
+  const action = String(body.action || "add").toLowerCase(); // add | remove | set
+  const tag = String(body.tag || "").trim();
+  const tagsIn = Array.isArray(body.tags) ? body.tags.map(s => String(s).trim()).filter(Boolean) : null;
 
-  if (!shop || !orderId) return res.status(400).json({ ok:false, error:"Missing shop or orderId" });
-  if (action !== "set" && !tag) return res.status(400).json({ ok:false, error:"Missing tag" });
+  if (!shop || !orderId) return res.status(400).json({ ok: false, error: "Missing shop or orderId" });
+  if (action !== "set" && !tag) return res.status(400).json({ ok: false, error: "Missing tag" });
 
   try {
-    // 1) Read current order from Shopify to get existing tags
-    const { getOrder, setOrderTags } = await import("./lib/shopify.js");
-    const cur = await getOrder(shop, orderId, SHOPIFY_ADMIN_TOKEN);
-    const currentTags = (cur?.tags || "")
+    // Read current tags from Sheets (cheap & immediate)
+    const { getAll, upsertOrder } = await import("./lib/sheets.js");
+    const all = await getAll(process.env.TAB_ORDERS || "TBL_ORDER");
+    const curRow = all.find(r =>
+      String(r.SHOP_DOMAIN || "").toLowerCase() === shop &&
+      String(r.ORDER_ID || "") === orderId
+    );
+    const currentTags = (curRow?.TAGS || "")
       .split(",")
       .map(s => s.trim())
       .filter(Boolean);
 
     let nextTags = currentTags;
-
     if (action === "add") {
-      if (!currentTags.includes(tag)) nextTags = [...currentTags, tag];
+      if (!currentTags.map(t => t.toLowerCase()).includes(tag.toLowerCase())) {
+        nextTags = [...currentTags, tag];
+      }
     } else if (action === "remove") {
       nextTags = currentTags.filter(t => t.toLowerCase() !== tag.toLowerCase());
     } else if (action === "set") {
-      nextTags = (tags || []);
+      nextTags = tagsIn || [];
     }
 
-    // 2) Write back to Shopify
-    // const updated = await setOrderTags(shop, orderId, nextTags, SHOPIFY_ADMIN_TOKEN);
+    // Upsert a minimal row so the dashboard reflects immediately
+    await upsertOrder({
+      SHOP_DOMAIN: shop,
+      ORDER_ID: orderId,
+      TAGS: nextTags.join(", "),
+      UPDATED_AT: new Date().toISOString()
+    });
 
-    // 3) Normalize + upsert to Sheets so UI reflects immediately (no webhook wait)
-    const { normalizeOrderPayload } = await import("./lib/shopify.js");
-    const { upsertOrder } = await import("./lib/sheets.js");
-
-    // const { order } = normalizeOrderPayload(updated, shop);
-    
-    order.TAGS = nextTags.join(', ');
-    order.UPDATED_AT = new Date().toISOString();
-    await upsertOrder(order);
-
-    // 4) Bust caches
     try { invalidateByTag("orders"); } catch {}
 
-    return res.status(200).json({ ok:true, tags: nextTags });
+    return res.status(200).json({ ok: true, tags: nextTags });
   } catch (e) {
-    return res.status(500).json({ ok:false, error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 }
