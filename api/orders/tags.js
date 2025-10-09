@@ -1,7 +1,6 @@
 // api/orders/tags.js
 import { setCors } from '../lib/cors.js';
 import { getAll, upsertOrder } from '../lib/sheets.js';
-res.setHeader('x-handler', 'file:orders/tags.js');
 export const config = { api: { bodyParser: false }, runtime: 'nodejs' };
 
 // Small helper identical to your [...route].js version
