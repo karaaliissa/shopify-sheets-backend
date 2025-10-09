@@ -512,9 +512,12 @@ const routes = new Map([
   // add: "print/picking", "work/*" handlers if you want them here
 ]);
 
+// export default async function main(req, res) {
+//   setCors(req, res);
+//   if (req.method === "OPTIONS") return res.status(204).end();
 export default async function main(req, res) {
   setCors(req, res);
-  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method === 'OPTIONS') return res.status(204).end();
 
   const path = extractPath(req);
   const handler = routes.get(path);
