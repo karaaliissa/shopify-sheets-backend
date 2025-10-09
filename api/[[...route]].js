@@ -193,7 +193,7 @@ async function handleItems(req, res) {
 async function handleShipday(req, res) {
   if (req.method !== "GET") return res.status(405).send("Method Not Allowed");
   exposeDownloadHeaders(res);
-
+  const { getAll, Tabs } = await import("./lib/sheets.js");
   const shop = (req.query.shop || "").trim();
   const dateQ = (req.query.date || new Date().toISOString().slice(0,10)).slice(0,10);
   const allFlag = String(req.query.all || "").toLowerCase() === "1";
@@ -332,7 +332,7 @@ async function handlePickingListJson(req, res) {
   const shop = (req.query.shop || "").toLowerCase();
   const fromIso = req.query.from ? new Date(req.query.from) : null;
   const toIso   = req.query.to   ? new Date(req.query.to)   : null;
-
+  const { getAll, Tabs } = await import("./lib/sheets.js");
   const orders = await getAll(Tabs.ORDERS);
   const ordersFiltered = orders.filter(o => {
     if (shop && (o.SHOP_DOMAIN || "").toLowerCase() !== shop) return false;
@@ -533,6 +533,9 @@ const routes = new Map([
 //   setCors(req, res);
 //   if (req.method === "OPTIONS") return res.status(204).end();
 export default async function main(req, res) {
+  const { setCors } = await import("./lib/cors.js");
+  const { extractPath } = await import("./lib/router.js");
+  res.setHeader('x-handler', 'catchall:[...route].js');
   setCors(req, res);
   if (req.method === "OPTIONS") return res.status(204).end(); 
 

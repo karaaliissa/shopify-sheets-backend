@@ -13,6 +13,7 @@ async function readJsonBody(req) {
 }
 
 export default async function handler(req, res) {
+  res.setHeader('x-handler', 'file:orders/tag.js');
   setCors(req, res);
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'Method Not Allowed' });
