@@ -8,7 +8,10 @@ export const config = { api: { bodyParser: false, runtime: 'nodejs' } };
 export default async function handler(req, res) {
   setCors(req, res);
   if (req.method === 'OPTIONS') return res.status(204).end();
-  if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'Method Not Allowed' });
+//   if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'Method Not Allowed' });
+if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'Method Not Allowed' });
+req.query = req.query || {}; req.query.route = 'orders/tag';
+
 
   const bodyRaw = await getRawBody(req);
   let body = {};
@@ -37,5 +40,6 @@ export default async function handler(req, res) {
   }
 
   await upsertOrder({ SHOP_DOMAIN: shop, ORDER_ID: orderId, TAGS: next.join(', ') });
-  return res.status(200).json({ ok:true, tags: next });
+//   return res.status(200).json({ ok:true, tags: next });
+return router(req, res); // lets your existing code path run
 }
