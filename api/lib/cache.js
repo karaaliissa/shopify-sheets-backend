@@ -1,6 +1,4 @@
-// Simple in-memory TTL cache (per serverless instance)
-// Good enough for free plan. No external services needed.
-
+// api/lib/cache.js
 const store = new Map(); // key -> { value, exp, tags:Set<string> }
 
 function now() { return Date.now(); }
