@@ -60,10 +60,18 @@ function exposeDownloadHeaders(res) {
   res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
 }
 
+// async function readJsonBody(req) {
+//   const raw = await getRawBody(req);
+//   try { return JSON.parse(raw.toString("utf8") || "{}"); }
+//   catch { return {}; }
+// }
+// /api/[...route].js
 async function readJsonBody(req) {
   const raw = await getRawBody(req);
-  try { return JSON.parse(raw.toString("utf8") || "{}"); }
-  catch { return {}; }
+  const s = raw.toString('utf8') || '';
+  try { return JSON.parse(s); } catch {}
+  try { return Object.fromEntries(new URLSearchParams(s).entries()); } catch {}
+  return {};
 }
 
 // HTTP cache headers (CDN + tiny client cache)
