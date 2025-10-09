@@ -522,7 +522,7 @@ const routes = new Map([
   ["order-items",     handleItems],
   ["export/shipday",  handleShipday],
   ["shipday",         handleShipday],
-  // ["orders/tag",     handleOrderTag],
+  // ["orders/tags",     handleOrderTag],
   ["picking-list",    handlePickingListJson],
   // ["print/picking",   handlePrintPicking],
   ["webhooks/shopify",handleWebhookShopify],
@@ -533,19 +533,18 @@ const routes = new Map([
 //   setCors(req, res);
 //   if (req.method === "OPTIONS") return res.status(204).end();
 export default async function main(req, res) {
-  const { setCors } = await import("./lib/cors.js");
-  const { extractPath } = await import("./lib/router.js");
   res.setHeader('x-handler', 'catchall:[...route].js');
-  setCors(req, res);
-  if (req.method === "OPTIONS") return res.status(204).end(); 
+  setCors(req, res);                            // use the static import at the top
+  if (req.method === "OPTIONS") return res.status(204).end();
 
-  const path = extractPath(req);
+  const path = extractPath(req);                // use the local function already in this file
   const handler = routes.get(path);
   if (!handler) return res.status(404).json({ ok:false, error:`Unknown route /api/${path}` });
 
   try { await handler(req, res); }
   catch (e) { res.status(500).json({ ok:false, error:String(e?.message || e) }); }
 }
+
 // async function handleOrderTag(req, res) {
 //   if (req.method !== "POST") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
 

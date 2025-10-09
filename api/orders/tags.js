@@ -1,19 +1,20 @@
-// api/orders/tag.js
+// api/orders/tags.js
 import { setCors } from '../lib/cors.js';
 import { getAll, upsertOrder } from '../lib/sheets.js';
-
+res.setHeader('x-handler', 'file:orders/tags.js');
 export const config = { api: { bodyParser: false }, runtime: 'nodejs' };
 
 // Small helper identical to your [...route].js version
 async function readJsonBody(req) {
   const chunks = [];
   for await (const c of req) chunks.push(c);
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); }
-  catch { return {}; }
+  const s = Buffer.concat(chunks).toString('utf8') || '';
+  try { return JSON.parse(s); } catch {}
+  try { return Object.fromEntries(new URLSearchParams(s).entries()); } catch {}
+  return {};
 }
-
 export default async function handler(req, res) {
-  res.setHeader('x-handler', 'file:orders/tag.js');
+  res.setHeader('x-handler', 'file:orders/tags.js');
   setCors(req, res);
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'Method Not Allowed' });
