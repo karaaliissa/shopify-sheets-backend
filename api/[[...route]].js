@@ -522,7 +522,7 @@ const routes = new Map([
   ["order-items",     handleItems],
   ["export/shipday",  handleShipday],
   ["shipday",         handleShipday],
-  ["orders/tag",     handleOrderTag],
+  // ["orders/tag",     handleOrderTag],
   ["picking-list",    handlePickingListJson],
   // ["print/picking",   handlePrintPicking],
   ["webhooks/shopify",handleWebhookShopify],
