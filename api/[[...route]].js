@@ -4,11 +4,11 @@
 import getRawBody from "raw-body";
 import crypto from "crypto";
 import { setCors } from "./lib/cors.js";
-import {
-  getAll, getLatestItems, upsertOrder, writeLineItems, logWebhook,
-  Tabs, createWorkEntry, markWorkDone
-} from "./lib/sheets.js";
-import { verifyShopifyHmac, normalizeOrderPayload, enrichLineItemImages } from "./lib/shopify.js";
+// import {
+//   getAll, getLatestItems, upsertOrder, writeLineItems, logWebhook,
+//   Tabs, createWorkEntry, markWorkDone
+// } from "./lib/sheets.js";
+// import { verifyShopifyHmac, normalizeOrderPayload, enrichLineItemImages } from "./lib/shopify.js";
 import { getCache, setCache, invalidateByTag, k } from "./lib/cache.js";
 
 export const config = { api: { bodyParser: false }, runtime: "nodejs" }; // important on Vercel
@@ -110,8 +110,9 @@ function setHttpCacheOk(res, seconds = 30) {
 async function handleOrders(req, res) {
   if (req.method !== "GET") {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+    
   }
-
+  const { getAll } = await import("./lib/sheets.js");
   const shop    = (req.query.shop || "").toLowerCase();
   const status  = (req.query.status || "").toLowerCase();
   const limit   = Math.min(Number(req.query.limit || 100), 1000);
@@ -151,7 +152,7 @@ async function handleOrders(req, res) {
 
 async function handleItems(req, res) {
   if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
-
+  const { getLatestItems } = await import("./lib/sheets.js");
   const shop    = (req.query.shop || "").toLowerCase();
   const orderId = String(req.query.order_id || "");
   const refresh = String(req.query.refresh || "").toLowerCase() === "1";
@@ -417,6 +418,8 @@ async function handlePickingListJson(req, res) {
 
 async function handleWebhookShopify(req, res) {
   if (req.method !== "POST") { res.setHeader("Allow","POST"); return res.status(405).json({ ok:false, error:"Method Not Allowed" }); }
+   const { normalizeOrderPayload } =
+     await import("./lib/shopify.js");
   const { SHOPIFY_WEBHOOK_SECRET, DEBUG_BYPASS_TOKEN, ALLOW_DEBUG_BYPASS = "false", SHOPIFY_ADMIN_TOKEN } = process.env;
 
   const topic      = req.headers["x-shopify-topic"] || req.headers["X-Shopify-Topic"] || "";
@@ -432,6 +435,7 @@ async function handleWebhookShopify(req, res) {
   if (allowBypass) hmacOk = true;
   else {
     if (!SHOPIFY_WEBHOOK_SECRET) return res.status(500).json({ ok:false, error:"Missing SHOPIFY_WEBHOOK_SECRET" });
+    const { verifyShopifyHmac } = await import("./lib/shopify.js");
     hmacOk = verifyShopifyHmac(raw, SHOPIFY_WEBHOOK_SECRET, headerHmac);
   }
   if (!hmacOk) return res.status(401).json({ ok:false, error:"Invalid HMAC" });
@@ -440,6 +444,7 @@ async function handleWebhookShopify(req, res) {
   catch { return res.status(400).json({ ok:false, error:"Invalid JSON" }); }
 
   const { order, lineItems } = normalizeOrderPayload(payload, shopDomain);
+  const { enrichLineItemImages } = await import("./lib/shopify.js");
 
   let items = lineItems;
   try { items = await enrichLineItemImages(shopDomain, items, SHOPIFY_ADMIN_TOKEN); }
@@ -447,8 +452,10 @@ async function handleWebhookShopify(req, res) {
 
   let action = "none", errMsg = "";
   try {
+    const { upsertOrder } = await import("./lib/sheets.js");
     const out = await upsertOrder(order);
     action = out?.action || "none";
+    const { writeLineItems } = await import("./lib/sheets.js");
     if (Array.isArray(items) && items.length) await writeLineItems(items, Date.now());
   } catch (e) {
     errMsg = e?.message || String(e);
@@ -456,6 +463,7 @@ async function handleWebhookShopify(req, res) {
 
   // cache invalidation (once)
   try {
+    const { invalidateByTag } = await import("./lib/cache.js");
     invalidateByTag("orders");
     if (order?.SHOP_DOMAIN && order?.ORDER_ID) {
       const s = String(order.SHOP_DOMAIN).toLowerCase();
@@ -467,6 +475,7 @@ async function handleWebhookShopify(req, res) {
 
   // log webhook
   try {
+    const { logWebhook } = await import("./lib/sheets.js");
     const hash = crypto.createHash("sha256").update(raw).digest("hex").slice(0, 16);
     await logWebhook({ TS:new Date().toISOString(), SHOP_DOMAIN:shopDomain, TOPIC:topic, ORDER_ID:order?.ORDER_ID ?? "", HASH:hash, RESULT:action, ERROR:errMsg });
   } catch (e) { console.error("logWebhook error:", e?.message || e); }
@@ -517,7 +526,7 @@ const routes = new Map([
 //   if (req.method === "OPTIONS") return res.status(204).end();
 export default async function main(req, res) {
   setCors(req, res);
-  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method === "OPTIONS") return res.status(204).end(); 
 
   const path = extractPath(req);
   const handler = routes.get(path);
@@ -587,12 +596,13 @@ async function handleOrderTag(req, res) {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
   }
 
-  const { SHOPIFY_ADMIN_TOKEN } = process.env;
-  if (!SHOPIFY_ADMIN_TOKEN) {
-    return res.status(500).json({ ok: false, error: "Missing SHOPIFY_ADMIN_TOKEN" });
-  }
+  // const { SHOPIFY_ADMIN_TOKEN } = process.env;
+  // if (!SHOPIFY_ADMIN_TOKEN) {
+  //   return res.status(500).json({ ok: false, error: "Missing SHOPIFY_ADMIN_TOKEN" });
+  // }
 
   const body = await readJsonBody(req);
+  // const { readJsonBody } = await import("./lib/cors.js");
   const shop = String(body.shop || "").toLowerCase();
   const orderId = String(body.orderId || "");
   const action = String(body.action || "add").toLowerCase(); // add | remove | set
@@ -605,6 +615,7 @@ async function handleOrderTag(req, res) {
   try {
     // Read current tags from Sheets (cheap & immediate)
     const { getAll, upsertOrder } = await import("./lib/sheets.js");
+    // const { invalidateByTag } = await import("./lib/cache.js");
     const all = await getAll(process.env.TAB_ORDERS || "TBL_ORDER");
     const curRow = all.find(r =>
       String(r.SHOP_DOMAIN || "").toLowerCase() === shop &&
