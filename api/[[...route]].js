@@ -123,7 +123,9 @@ async function handleOrders(req, res) {
     const all = await getAll(process.env.TAB_ORDERS || "TBL_ORDER");
     let rows = shop ? all.filter(r => (r.SHOP_DOMAIN || "").toLowerCase() === shop) : all;
     if (status) rows = rows.filter(r => (r.FULFILLMENT_STATUS || "").toLowerCase() === status);
-    rows.sort((a, b) => (a.UPDATED_AT < b.UPDATED_AT ? 1 : -1));
+    // rows.sort((a, b) => (a.UPDATED_AT < b.UPDATED_AT ? 1 : -1));
+    // rows.sort((a, b) => Number(b.ORDER_ID) - Number(a.ORDER_ID));
+    rows.sort((a, b) => (a.CREATED_AT < b.CREATED_AT ? 1 : -1));
     return { ok: true, items: rows.slice(0, limit) };
   };
 
@@ -623,11 +625,11 @@ async function handleOrderTag(req, res) {
 
     // Upsert a minimal row so the dashboard reflects immediately
     await upsertOrder({
-      SHOP_DOMAIN: shop,
-      ORDER_ID: orderId,
-      TAGS: nextTags.join(", "),
-      UPDATED_AT: new Date().toISOString()
-    });
+         SHOP_DOMAIN: shop,
+         ORDER_ID: orderId,
+         TAGS: nextTags.join(", ")
+         // DO NOT set UPDATED_AT here – keep Shopify’s timestamp
+       });
 
     try { invalidateByTag("orders"); } catch {}
 
