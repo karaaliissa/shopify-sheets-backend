@@ -115,6 +115,60 @@ function setHttpCacheOk(res, seconds = 30) {
 //     return res.status(200).json(fallback);
 //   }
 // }
+async function handleSetDeliverBy(req, res) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ ok:false, error:"Method Not Allowed" });
+  }
+  const body = await readJsonBody(req);
+  const shop    = String(body.shop || "").toLowerCase();
+  const orderId = String(body.orderId || "");
+  let deliverBy = body.deliverBy === null ? null : String(body.deliverBy || "").trim() || null;
+  const autoIfExpress = String(body.autoIfExpress || "").toLowerCase() === "true";
+
+  if (!shop || !orderId) {
+    return res.status(400).json({ ok:false, error:"Missing shop or orderId" });
+  }
+  if (deliverBy && !/^\d{4}-\d{2}-\d{2}$/.test(deliverBy)) {
+    return res.status(400).json({ ok:false, error:"Bad date format (YYYY-MM-DD)" });
+  }
+
+  try {
+    const { getAll, upsertOrder, upsertOrderField } = await import("./lib/sheets.js");
+    const all = await getAll(process.env.TAB_ORDERS || "TBL_ORDER");
+    const row = all.find(r =>
+      String(r.SHOP_DOMAIN || "").toLowerCase() === shop &&
+      String(r.ORDER_ID || "") === orderId
+    );
+    if (!row) return res.status(404).json({ ok:false, error:"Order not found in sheet" });
+
+    // Optional: auto for express if requested and no date provided
+    if (autoIfExpress && !deliverBy) {
+      const isExpress = /\bexpress\b/i.test(String(row.SHIPPING_METHOD || ""));
+      if (isExpress) {
+        const created = new Date(row.CREATED_AT || row.UPDATED_AT || Date.now());
+        const hr = new Date(created).getHours(); // local runtime hour
+        const base = new Date(created);
+        base.setDate(base.getDate() + (hr < 12 ? 1 : 2));
+        deliverBy = base.toISOString().slice(0,10);
+      }
+    }
+
+    // Persist only the DELIVER_BY field (without touching UPDATED_AT)
+    if (typeof upsertOrderField === "function") {
+      await upsertOrderField({ shopDomain: shop, orderId, field: "DELIVER_BY", value: deliverBy ?? "" });
+    } else {
+      await upsertOrder({ SHOP_DOMAIN: shop, ORDER_ID: orderId, DELIVER_BY: deliverBy ?? "" });
+    }
+
+    // Bust cache
+    try { invalidateByTag("orders"); } catch {}
+
+    return res.status(200).json({ ok:true, deliverBy });
+  } catch (e) {
+    return res.status(500).json({ ok:false, error: e?.message || String(e) });
+  }
+}
+
 async function handleOrders(req, res) {
   if (req.method !== "GET") {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
@@ -455,6 +509,7 @@ async function handleWebhookShopify(req, res) {
   const { enrichLineItemImages } = await import("./lib/shopify.js");
 
   let items = lineItems;
+  
   try { items = await enrichLineItemImages(shopDomain, items, SHOPIFY_ADMIN_TOKEN); }
   catch (e) { console.error("enrichLineItemImages:", e?.message || e); }
 
@@ -522,11 +577,9 @@ const routes = new Map([
   ["order-items",     handleItems],
   ["export/shipday",  handleShipday],
   ["shipday",         handleShipday],
-  // ["orders/tags",     handleOrderTag],
+  ["orders/deliver-by", handleSetDeliverBy],
   ["picking-list",    handlePickingListJson],
-  // ["print/picking",   handlePrintPicking],
   ["webhooks/shopify",handleWebhookShopify],
-  // add: "print/picking", "work/*" handlers if you want them here
 ]);
 
 // export default async function main(req, res) {

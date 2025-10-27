@@ -22,6 +22,33 @@ function getClient() {
   );
   return google.sheets({ version: "v4", auth });
 }
+export async function upsertOrderField({ shopDomain, orderId, field, value }) {
+  const sheets = getClient();
+  const headers = await getHeaders(sheets, TAB_ORDERS);
+  const all = await getAll(TAB_ORDERS);
+
+  const idx = all.findIndex(
+    r => String(r.SHOP_DOMAIN).toLowerCase() === String(shopDomain).toLowerCase()
+      && String(r.ORDER_ID) === String(orderId)
+  );
+  if (idx < 0) throw new Error("Order not found");
+
+  const current = all[idx];
+  const next = { ...current, [field]: value ?? "" };
+
+  const row = objToRow(headers, next);
+  const rowNumber = idx + 2;
+  const endCol = String.fromCharCode(64 + headers.length);
+  const range = `${TAB_ORDERS}!A${rowNumber}:${endCol}${rowNumber}`;
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SHEET_ID,
+    range,
+    valueInputOption: "USER_ENTERED",
+    requestBody: { values: [row] }
+  });
+  return { ok: true };
+}
 
 async function getHeaders(sheets, tab) {
   const res = await sheets.spreadsheets.values.get({
@@ -68,8 +95,6 @@ export async function appendObjects(tab, objs) {
 export async function upsertOrder(orderObj) {
   const sheets = getClient();
   const headers = await getHeaders(sheets, TAB_ORDERS);
-
-  // read all orders
   const all = await getAll(TAB_ORDERS);
 
   const idx = all.findIndex(
@@ -79,29 +104,18 @@ export async function upsertOrder(orderObj) {
 
   if (idx >= 0) {
     const current = all[idx];
-    // const incoming = new Date(orderObj.UPDATED_AT || 0).getTime() || 0;
-    // const existing = new Date(current.UPDATED_AT || 0).getTime() || 0;
-    //     const tagsChanged =
-    //       String(current.TAGS ?? '') !== String(orderObj.TAGS ?? '');
-  
-    //     if (incoming <= existing) {
-    //       return { action: "skipped-older-or-equal" };
-    //     }
-    //     // If Shopify timestamp didn't move but tags changed, still update.
-    //     if (incoming <= existing && !tagsChanged) {
-    //       return { action: "skipped-older-or-equal" };
-    //     }
     const incoming = new Date(orderObj.UPDATED_AT || 0).getTime() || 0;
     const existing = new Date(current.UPDATED_AT || 0).getTime() || 0;
+
     const tagsChanged = String(current.TAGS ?? '') !== String(orderObj.TAGS ?? '');
-    
-    if (incoming <= existing && !tagsChanged) {
+    const dateChanged = String(current.DELIVER_BY ?? '') !== String(orderObj.DELIVER_BY ?? '');
+
+    if (incoming <= existing && !tagsChanged && !dateChanged) {
       return { action: "skipped-older-or-equal" };
     }
-    // else allow update (either newer timestamp OR tags changed)
-    
+
     const row = objToRow(headers, { ...current, ...orderObj });
-    const rowNumber = idx + 2; // +1 header, +1 index
+    const rowNumber = idx + 2;
     const endCol = String.fromCharCode(64 + headers.length);
     const range = `${TAB_ORDERS}!A${rowNumber}:${endCol}${rowNumber}`;
 
@@ -117,6 +131,7 @@ export async function upsertOrder(orderObj) {
     return { action: "inserted" };
   }
 }
+
 
 
 export async function writeLineItems(items, batchTs) {
