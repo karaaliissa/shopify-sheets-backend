@@ -587,15 +587,20 @@ const routes = new Map([
 //   if (req.method === "OPTIONS") return res.status(204).end();
 export default async function main(req, res) {
   res.setHeader('x-handler', 'catchall:[...route].js');
-  setCors(req, res);                            // use the static import at the top
-  if (req.method === "OPTIONS") return res.status(204).end();
 
-  const path = extractPath(req);                // use the local function already in this file
+  // Handle CORS (also terminates OPTIONS)
+  const preflightHandled = setCors(req, res);
+  if (preflightHandled) return;
+
+  const path = extractPath(req);
   const handler = routes.get(path);
   if (!handler) return res.status(404).json({ ok:false, error:`Unknown route /api/${path}` });
 
-  try { await handler(req, res); }
-  catch (e) { res.status(500).json({ ok:false, error:String(e?.message || e) }); }
+  try {
+    await handler(req, res);
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e?.message || e) });
+  }
 }
 
 // async function handleOrderTag(req, res) {
