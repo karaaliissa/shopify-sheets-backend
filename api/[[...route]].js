@@ -177,7 +177,7 @@ async function handleOrders(req, res) {
   const { getAll } = await import("./lib/sheets.js");
   const shop    = (req.query.shop || "").toLowerCase();
   const status  = (req.query.status || "").toLowerCase();
-  const limit   = Math.min(Number(req.query.limit || 100), 1000);
+  const limit   = Math.min(Number(req.query.limit || 50), 1000);
   const refresh = String(req.query.refresh || "").toLowerCase() === "1";
 
   const key = k(["orders", shop, status, limit]);
