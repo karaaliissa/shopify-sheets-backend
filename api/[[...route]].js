@@ -1,5 +1,4 @@
 // /api/[...route].js
-
 import getRawBody from "raw-body";
 import crypto from "crypto";
 import { setCors } from "./lib/cors.js";
@@ -54,7 +53,6 @@ function exposeDownloadHeaders(res) {
   res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
 }
 
-// /api/[...route].js
 async function readJsonBody(req) {
   const raw = await getRawBody(req);
   const s = raw.toString('utf8') || '';
@@ -69,7 +67,6 @@ function setHttpCacheOk(res, seconds = 30) {
 }
 
 // --- HANDLERS ---------------------------------------------------------------
-
 async function handleSetDeliverBy(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ ok:false, error:"Method Not Allowed" });
@@ -123,84 +120,6 @@ async function handleSetDeliverBy(req, res) {
     return res.status(500).json({ ok:false, error: e?.message || String(e) });
   }
 }
-async function handleOrdersSummary(req, res) {
-  if (req.method !== "GET") {
-    res.setHeader("Allow", "GET");
-    return res.status(405).json({ ok:false, error:"Method Not Allowed" });
-  }
-  const { getAll, Tabs } = await import("./lib/sheets.js");
-  const all = await getAll(Tabs.ORDERS);
-
-  // same canonical logic as UI
-  const statusOf = (r) => {
-    const tags = (r.TAGS || "").toLowerCase();
-    if (tags.includes("complete"))  return "complete";
-    if (tags.includes("cancel"))    return "cancel";
-    if (tags.includes("shipped"))   return "shipped";
-    if (tags.includes("processing"))return "processing";
-    const f = (r.FULFILLMENT_STATUS || "").toLowerCase();
-    if (!f || f === "open" || f === "unfulfilled") return "pending";
-    return "pending";
-  };
-  const isExpress = (r) => /\bexpress\b/i.test(String(r.SHIPPING_METHOD || ""));
-
-  const out = {
-    ok: true,
-    total: all.length,
-    pending: 0, processing: 0, shipped: 0, complete: 0, cancel: 0,
-    expressPending: 0, expressProcessing: 0, expressShipped: 0, expressComplete: 0, expressCancel: 0,
-  };
-
-  for (const r of all) {
-    const s = statusOf(r);
-    out[s] += 1;
-    if (isExpress(r)) {
-      if (s === "pending")     out.expressPending++;
-      else if (s === "processing") out.expressProcessing++;
-      else if (s === "shipped") out.expressShipped++;
-      else if (s === "complete")out.expressComplete++;
-      else if (s === "cancel") out.expressCancel++;
-    }
-  }
-
-  // tiny public cache
-  res.setHeader("Cache-Control", "public, max-age=5, s-maxage=30, stale-while-revalidate=60");
-  return res.status(200).json(out);
-}
-
-function encodeCursor(n) { return Buffer.from(String(n)).toString("base64"); }
-function decodeCursor(c) {
-  if (!c) return 0;
-  try { return Number(Buffer.from(String(c), "base64").toString("utf8")) || 0; }
-  catch { return 0; }
-}
-
-async function handleOrdersPage(req, res) {
-  if (req.method !== "GET") {
-    res.setHeader("Allow", "GET");
-    return res.status(405).json({ ok:false, error:"Method Not Allowed" });
-  }
-  const { getAll, Tabs } = await import("./lib/sheets.js");
-
-  const shop    = String(req.query.shop || "").toLowerCase();
-  const limit   = Math.min(Number(req.query.limit || 25), 100);
-  const cursor  = String(req.query.cursor || "");
-  const offset  = decodeCursor(cursor);
-
-  // load all then filter (Sheets doesn’t page natively)
-  let rows = await getAll(Tabs.ORDERS);
-  if (shop) rows = rows.filter(r => String(r.SHOP_DOMAIN || "").toLowerCase() === shop);
-
-  // sort newest first (match your UI)
-  rows.sort((a,b) => (a.CREATED_AT < b.CREATED_AT ? 1 : -1));
-
-  const total = rows.length;
-  const slice = rows.slice(offset, offset + limit);
-  const next  = offset + limit < total ? encodeCursor(offset + limit) : null;
-
-  res.setHeader("Cache-Control", "public, max-age=5, s-maxage=30, stale-while-revalidate=60");
-  return res.status(200).json({ ok:true, items: slice, nextCursor: next, total });
-}
 
 async function handleOrders(req, res) {
   if (req.method !== "GET") {
@@ -219,8 +138,6 @@ async function handleOrders(req, res) {
     const all = await getAll(process.env.TAB_ORDERS || "TBL_ORDER");
     let rows = shop ? all.filter(r => (r.SHOP_DOMAIN || "").toLowerCase() === shop) : all;
     if (status) rows = rows.filter(r => (r.FULFILLMENT_STATUS || "").toLowerCase() === status);
-    // rows.sort((a, b) => (a.UPDATED_AT < b.UPDATED_AT ? 1 : -1));
-    // rows.sort((a, b) => Number(b.ORDER_ID) - Number(a.ORDER_ID));
     rows.sort((a, b) => (a.CREATED_AT < b.CREATED_AT ? 1 : -1));
     return { ok: true, items: rows.slice(0, limit) };
   };
@@ -336,84 +253,7 @@ async function handleShipday(req, res) {
   res.setHeader("Content-Disposition", `attachment; filename="shipday-${dateQ}.csv"`);
   return res.status(200).send(csv);
 }
-// async function handlePickingListJson(req, res) {
-//   if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
-//   const shop = (req.query.shop || "").toLowerCase();
-//   const fromIso = req.query.from ? new Date(req.query.from) : null;
-//   const toIso   = req.query.to   ? new Date(req.query.to)   : null;
 
-//   const orders = await getAll(Tabs.ORDERS);
-//   const ordersFiltered = orders.filter(o => {
-//     if (shop && (o.SHOP_DOMAIN || "").toLowerCase() !== shop) return false;
-//     const t = new Date(o.CREATED_AT || o.UPDATED_AT || 0).getTime();
-//     if (fromIso && t < fromIso.getTime()) return false;
-//     if (toIso && t > toIso.getTime()) return false;
-//     return true;
-//   });
-
-//   const orderIdSet = new Set(ordersFiltered.map(o => String(o.ORDER_ID)));
-//   const orderNameById = new Map(
-//     ordersFiltered.map(o => [String(o.ORDER_ID), o.ORDER_NAME || `#${o.ORDER_ID}`])
-//   );
-//   const shipMethodById = new Map(
-//     ordersFiltered.map(o => [String(o.ORDER_ID), (o.SHIPPING_METHOD || "").toString()])
-//   );
-
-//   const itemsAll = await getAll(Tabs.ITEMS);
-//   const itemsForOrders = itemsAll.filter(r =>
-//     (!shop || (r.SHOP_DOMAIN || "").toLowerCase() === shop) && orderIdSet.has(String(r.ORDER_ID))
-//   );
-
-//   const latestBatchByOrder = new Map();
-//   for (const it of itemsForOrders) {
-//     const key = `${it.SHOP_DOMAIN}|${String(it.ORDER_ID)}`;
-//     const ts = Number(it.BATCH_TS || 0);
-//     if (!latestBatchByOrder.has(key) || ts > latestBatchByOrder.get(key)) latestBatchByOrder.set(key, ts);
-//   }
-//   const latestItems = itemsForOrders.filter(
-//     it => Number(it.BATCH_TS || 0) === latestBatchByOrder.get(`${it.SHOP_DOMAIN}|${String(it.ORDER_ID)}`)
-//   );
-
-//   // Group by item key, but keep per-order express info
-//   const byKey = new Map(); // key -> { …, ORDERS: Map<orderName, isExpress> }
-//   for (const it of latestItems) {
-//     const sku = (it.SKU || "").trim();
-//     const k = sku || `${it.TITLE || ""}|${it.VARIANT_TITLE || ""}`;
-//     const qty = Number(it.FULFILLABLE_QUANTITY ?? it.QUANTITY ?? 0);
-//     const orderId = String(it.ORDER_ID);
-//     const orderName = orderNameById.get(orderId) || `#${orderId}`;
-//     const method = shipMethodById.get(orderId) || "";
-//     const isExpress = /\bexpress\b/i.test(method);
-
-//     if (!byKey.has(k)) {
-//       byKey.set(k, {
-//         KEY: k,
-//         SKU: sku || "",
-//         TITLE: it.TITLE || "",
-//         VARIANT_TITLE: it.VARIANT_TITLE || "",
-//         IMAGE: it.IMAGE || "",
-//         TOTAL_QTY: 0,
-//         ORDERS: new Map() // name -> boolean (isExpress)
-//       });
-//     }
-
-//     const g = byKey.get(k);
-//     g.TOTAL_QTY += qty;
-//     g.IMAGE = g.IMAGE || it.IMAGE || "";
-//     // if same order name appears multiple times, keep TRUE if any line is express
-//     g.ORDERS.set(orderName, (g.ORDERS.get(orderName) || false) || isExpress);
-//   }
-
-//   const rows = Array.from(byKey.values())
-//     .map(g => ({
-//       ...g,
-//       ORDERS: Array.from(g.ORDERS.entries()).map(([NAME, IS_EXPRESS]) => ({ NAME, IS_EXPRESS }))
-//     }))
-//     .filter(x => x.TOTAL_QTY > 0)
-//     .sort((a, b) => b.TOTAL_QTY - a.TOTAL_QTY);
-
-//   return res.status(200).json({ ok: true, items: rows });
-// }
 async function handlePickingListJson(req, res) {
   if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
   const shop = (req.query.shop || "").toLowerCase();
@@ -606,8 +446,6 @@ function extractPath(req) {
 const routes = new Map([
   ["",                async (req,res) => res.status(200).json({ ok:true, routes: Array.from(routes.keys()).filter(Boolean) })],
   ["orders",          handleOrders],
-  ["orders/summary",  handleOrdersSummary],
-  ["orders/page",     handleOrdersPage],
   ["items",           handleItems],
   ["order-items",     handleItems],
   ["export/shipday",  handleShipday],
@@ -618,9 +456,6 @@ const routes = new Map([
   ["orders/tags",     handleOrderTag]
 ]);
 
-// export default async function main(req, res) {
-//   setCors(req, res);
-//   if (req.method === "OPTIONS") return res.status(204).end();
 export default async function main(req, res) {
   res.setHeader('x-handler', 'catchall:[...route].js');
 
@@ -638,10 +473,13 @@ export default async function main(req, res) {
     res.status(500).json({ ok:false, error:String(e?.message || e) });
   }
 }
+
 async function handleOrderTag(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
   }
+
+
   const body = await readJsonBody(req);
   // const { readJsonBody } = await import("./lib/cors.js");
   const shop = String(body.shop || "").toLowerCase();
