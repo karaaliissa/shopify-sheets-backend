@@ -177,14 +177,46 @@ async function handleFulfill(body, res) {
     }
 
     // 3) Choose location_id
-    const envLoc   = process.env.SHOPIFY_LOCATION_ID ? Number(process.env.SHOPIFY_LOCATION_ID) : null;
-    const orderLoc = order.location_id || (order.fulfillments?.[0]?.location_id) || null;
-    const locationId = envLoc || orderLoc;
+    let envLoc   = process.env.SHOPIFY_LOCATION_ID ? Number(process.env.SHOPIFY_LOCATION_ID) : null;
+    let orderLoc = order.location_id || (order.fulfillments?.[0]?.location_id) || null;
+    let locationId = envLoc || orderLoc;
+
+    // 🔥 NEW: if still no locationId, fetch locations from Shopify and pick one
+    if (!locationId) {
+      const locRes = await fetch(`${baseUrl}/locations.json`, {
+        method: 'GET',
+        headers: {
+          'X-Shopify-Access-Token': token,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!locRes.ok) {
+        const t = await locRes.text();
+        console.error('locations fetch failed:', locRes.status, t);
+        return res
+          .status(502)
+          .json({ ok: false, error: `Failed to fetch locations from Shopify (${locRes.status})` });
+      }
+
+      const locJson = await locRes.json();
+      const locations = locJson?.locations || [];
+
+      // Prefer an active / non-deactivated location
+      const chosen =
+        locations.find(l => !l.deactivated_at) ||
+        locations[0];
+
+      if (chosen) {
+        locationId = chosen.id;
+        console.log('Using auto-detected location_id:', locationId);
+      }
+    }
 
     if (!locationId) {
       return res
         .status(500)
-        .json({ ok: false, error: 'No location_id for fulfillment (set SHOPIFY_LOCATION_ID or ensure order has one)' });
+        .json({ ok: false, error: 'No location_id for fulfillment (even after locations lookup)' });
     }
 
     // 4) Create fulfillment
@@ -222,6 +254,7 @@ async function handleFulfill(body, res) {
       .json({ ok: false, error: e?.message || String(e) });
   }
 }
+
 
 // ===== single handler that routes to one of the two =====
 export default async function handler(req, res) {
