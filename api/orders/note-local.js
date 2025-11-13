@@ -118,9 +118,9 @@ async function handleNoteLocal(body, res) {
 
 // ===== FULFILL LOGIC (Shopify fulfillment) =====
 async function handleFulfill(body, res) {
-  const shop    = String(body.shop || '').toLowerCase();
-  const orderId = String(body.orderId || '');
-  const token   = process.env.SHOPIFY_ADMIN_TOKEN;
+  const shop       = String(body.shop || '').toLowerCase();
+  const orderId    = String(body.orderId || '');
+  const token      = process.env.SHOPIFY_ADMIN_TOKEN;
   const apiVersion = process.env.SHOPIFY_API_VERSION || '2024-01';
 
   if (!shop || !orderId) {
@@ -137,110 +137,86 @@ async function handleFulfill(body, res) {
   try {
     const baseUrl = `https://${shop}/admin/api/${apiVersion}`;
 
-    // 1) Load order
-    const orderRes = await fetch(`${baseUrl}/orders/${orderId}.json`, {
-      method: 'GET',
-      headers: {
-        'X-Shopify-Access-Token': token,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    if (!orderRes.ok) {
-      const t = await orderRes.text();
-      console.error('fetch order failed:', orderRes.status, t);
-      return res
-        .status(502)
-        .json({ ok: false, error: `Failed to fetch order from Shopify (${orderRes.status})` });
-    }
-
-    const orderJson = await orderRes.json();
-    const order = orderJson?.order;
-    if (!order) {
-      return res
-        .status(404)
-        .json({ ok: false, error: 'Order not found in Shopify' });
-    }
-
-    // 2) Build fulfillable line items
-    const lineItems = (order.line_items || [])
-      .map(li => ({
-        id: li.id,
-        quantity: li.fulfillable_quantity ?? li.quantity ?? 0
-      }))
-      .filter(li => li.quantity > 0);
-
-    if (!lineItems.length) {
-      return res
-        .status(200)
-        .json({ ok: true, note: 'Nothing to fulfill (no fulfillable_quantity)' });
-    }
-
-    // 3) Choose location_id
-    let envLoc   = process.env.SHOPIFY_LOCATION_ID ? Number(process.env.SHOPIFY_LOCATION_ID) : null;
-    let orderLoc = order.location_id || (order.fulfillments?.[0]?.location_id) || null;
-    let locationId = envLoc || orderLoc;
-
-    // 🔥 NEW: if still no locationId, fetch locations from Shopify and pick one
-    if (!locationId) {
-      const locRes = await fetch(`${baseUrl}/locations.json`, {
+    // 1) Get fulfillment orders for this order
+    const foRes = await fetch(
+      `${baseUrl}/orders/${orderId}/fulfillment_orders.json`,
+      {
         method: 'GET',
         headers: {
           'X-Shopify-Access-Token': token,
-          'Content-Type': 'application/json'
-        }
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+
+    if (!foRes.ok) {
+      const text = await foRes.text();
+      console.error('fulfillment_orders fetch failed:', foRes.status, text);
+      let msg = `Failed to fetch fulfillment orders (${foRes.status})`;
+      try {
+        const j = JSON.parse(text);
+        if (j?.errors) msg += ' - ' + JSON.stringify(j.errors);
+      } catch {}
+      return res.status(502).json({ ok: false, error: msg });
+    }
+
+    const foJson = await foRes.json();
+    const fulfillmentOrders = foJson?.fulfillment_orders || [];
+
+    // 2) Build line_items_by_fulfillment_order from remaining quantities
+    const lineItemsByFO = fulfillmentOrders
+      .map((fo) => {
+        const items = (fo.line_items || [])
+          .map((li) => ({
+            id: li.id,
+            // use remaining_quantity when available
+            quantity:
+              li.remaining_quantity ??
+              li.unfulfilled_quantity ??
+              li.quantity ??
+              0,
+          }))
+          .filter((li) => li.quantity > 0);
+
+        if (!items.length) return null;
+        return {
+          fulfillment_order_id: fo.id,
+          fulfillment_order_line_items: items,
+        };
+      })
+      .filter(Boolean);
+
+    if (!lineItemsByFO.length) {
+      return res.status(200).json({
+        ok: true,
+        note: 'Nothing to fulfill (no remaining_quantity on any fulfillment order)',
       });
-
-      if (!locRes.ok) {
-        const t = await locRes.text();
-        console.error('locations fetch failed:', locRes.status, t);
-        return res
-          .status(502)
-          .json({ ok: false, error: `Failed to fetch locations from Shopify (${locRes.status})` });
-      }
-
-      const locJson = await locRes.json();
-      const locations = locJson?.locations || [];
-
-      // Prefer an active / non-deactivated location
-      const chosen =
-        locations.find(l => !l.deactivated_at) ||
-        locations[0];
-
-      if (chosen) {
-        locationId = chosen.id;
-        console.log('Using auto-detected location_id:', locationId);
-      }
     }
 
-    if (!locationId) {
-      return res
-        .status(500)
-        .json({ ok: false, error: 'No location_id for fulfillment (even after locations lookup)' });
-    }
-
-    // 4) Create fulfillment
+    // 3) Create fulfillment using the new API shape
     const fulfillRes = await fetch(`${baseUrl}/fulfillments.json`, {
       method: 'POST',
       headers: {
         'X-Shopify-Access-Token': token,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
       },
       body: JSON.stringify({
         fulfillment: {
-          location_id: locationId,
           notify_customer: false,
-          line_items: lineItems
-        }
-      })
+          line_items_by_fulfillment_order: lineItemsByFO,
+        },
+      }),
     });
 
     if (!fulfillRes.ok) {
-      const t = await fulfillRes.text();
-      console.error('fulfill failed:', fulfillRes.status, t);
-      return res
-        .status(502)
-        .json({ ok: false, error: `Failed to create fulfillment (${fulfillRes.status})` });
+      const text = await fulfillRes.text();
+      console.error('fulfill failed:', fulfillRes.status, text);
+      let msg = `Failed to create fulfillment (${fulfillRes.status})`;
+      try {
+        const j = JSON.parse(text);
+        if (j?.errors) msg += ' - ' + JSON.stringify(j.errors);
+      } catch {}
+      return res.status(502).json({ ok: false, error: msg });
     }
 
     const payload = await fulfillRes.json();
@@ -254,6 +230,7 @@ async function handleFulfill(body, res) {
       .json({ ok: false, error: e?.message || String(e) });
   }
 }
+
 
 
 // ===== single handler that routes to one of the two =====
