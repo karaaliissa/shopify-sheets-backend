@@ -453,7 +453,8 @@ const routes = new Map([
   ["orders/deliver-by", handleSetDeliverBy],
   ["picking-list",    handlePickingListJson],
   ["webhooks/shopify",handleWebhookShopify],
-  ["orders/tags",     handleOrderTag]
+  ["orders/tags",     handleOrderTag],
+  ["orders/fulfill",  handleFulfill]
 ]);
 
 export default async function main(req, res) {
