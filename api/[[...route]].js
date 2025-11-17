@@ -69,7 +69,106 @@ function setHttpCacheOk(res, seconds = 30) {
 }
 
 // --- HANDLERS ---------------------------------------------------------------
+async function handleBackfill(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ ok:false, error:"Method Not Allowed" });
+  }
 
+  const BACKFILL_TOKEN = process.env.BACKFILL_TOKEN || "";
+  const authToken =
+    req.query.token ||
+    req.headers["x-backfill-token"] ||
+    req.headers["X-Backfill-Token"];
+
+  if (!BACKFILL_TOKEN || authToken !== BACKFILL_TOKEN) {
+    return res.status(401).json({ ok:false, error:"Unauthorized backfill" });
+  }
+
+  const shop = String(req.query.shop || "").toLowerCase();
+  const from = String(req.query.from || "");
+  const to   = String(req.query.to   || "");
+
+  if (!shop || !from) {
+    return res.status(400).json({ ok:false, error:"Missing shop or from date" });
+  }
+
+  const createdMin = new Date(from).toISOString();
+  const createdMax = to ? new Date(to).toISOString() : new Date().toISOString();
+
+  const { SHOPIFY_ADMIN_TOKEN } = process.env;
+  if (!SHOPIFY_ADMIN_TOKEN) {
+    return res.status(500).json({ ok:false, error:"Missing SHOPIFY_ADMIN_TOKEN" });
+  }
+
+  // lazy import to avoid bloating cold starts
+  const { normalizeOrderPayload } = await import("./lib/shopify.js");
+  const { upsertOrder, writeLineItems } = await import("./lib/sheets.js");
+
+  let urlPath =
+    `/orders.json?status=any&limit=250` +
+    `&order=created_at asc` +
+    `&created_at_min=${encodeURIComponent(createdMin)}` +
+    `&created_at_max=${encodeURIComponent(createdMax)}`;
+
+  let inserted = 0, updated = 0, skipped = 0, total = 0;
+
+  while (urlPath) {
+    const url = `https://${shop}/admin/api/2024-07${urlPath}`;
+    const resp = await fetch(url, {
+      headers: {
+        "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      return res.status(500).json({
+        ok:false,
+        error:`Shopify ${resp.status}: ${text.slice(0,500)}`
+      });
+    }
+
+    const data = await resp.json();
+    const orders = data.orders || [];
+    total += orders.length;
+
+    for (const raw of orders) {
+      const { order, lineItems } = normalizeOrderPayload(raw, shop);
+      const result = await upsertOrder(order);
+
+      if (result?.action === "inserted") inserted++;
+      else if (result?.action === "updated") updated++;
+      else skipped++;
+
+      if (Array.isArray(lineItems) && lineItems.length) {
+        await writeLineItems(lineItems, Date.now());
+      }
+    }
+
+    // pagination via Link header
+    const link = resp.headers.get("link") || resp.headers.get("Link") || "";
+    const match = link.match(/<([^>]+)>;\s*rel="next"/);
+    if (!match) {
+      urlPath = null;
+    } else {
+      const nextUrl = new URL(match[1]);
+      urlPath =
+        nextUrl.pathname.replace("/admin/api/2024-07", "") + nextUrl.search;
+    }
+  }
+
+  return res.status(200).json({
+    ok: true,
+    totalFetched: total,
+    inserted,
+    updated,
+    skipped,
+    from: createdMin,
+    to: createdMax,
+  });
+}
 async function handleSetDeliverBy(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ ok:false, error:"Method Not Allowed" });
@@ -615,7 +714,8 @@ const routes = new Map([
   ["orders/deliver-by", handleSetDeliverBy],
   ["picking-list",    handlePickingListJson],
   ["webhooks/shopify",handleWebhookShopify],
-  ["orders/tags",     handleOrderTag]
+  ["orders/tags",     handleOrderTag],
+  ["admin/backfill",  handleBackfill]
 ]);
 
 // export default async function main(req, res) {
