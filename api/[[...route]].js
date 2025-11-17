@@ -1,8 +1,14 @@
 // /api/[...route].js
+// Unified router (robust) — keeps everything in one file.
 
 import getRawBody from "raw-body";
 import crypto from "crypto";
 import { setCors } from "./lib/cors.js";
+// import {
+//   getAll, getLatestItems, upsertOrder, writeLineItems, logWebhook,
+//   Tabs, createWorkEntry, markWorkDone
+// } from "./lib/sheets.js";
+// import { verifyShopifyHmac, normalizeOrderPayload, enrichLineItemImages } from "./lib/shopify.js";
 import { getCache, setCache, invalidateByTag, k } from "./lib/cache.js";
 
 export const config = { api: { bodyParser: false }, runtime: "nodejs" }; // important on Vercel
@@ -54,6 +60,11 @@ function exposeDownloadHeaders(res) {
   res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
 }
 
+// async function readJsonBody(req) {
+//   const raw = await getRawBody(req);
+//   try { return JSON.parse(raw.toString("utf8") || "{}"); }
+//   catch { return {}; }
+// }
 // /api/[...route].js
 async function readJsonBody(req) {
   const raw = await getRawBody(req);
@@ -69,106 +80,41 @@ function setHttpCacheOk(res, seconds = 30) {
 }
 
 // --- HANDLERS ---------------------------------------------------------------
-async function handleBackfill(req, res) {
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "POST");
-    return res.status(405).json({ ok:false, error:"Method Not Allowed" });
-  }
 
-  const BACKFILL_TOKEN = process.env.BACKFILL_TOKEN || "";
-  const authToken =
-    req.query.token ||
-    req.headers["x-backfill-token"] ||
-    req.headers["X-Backfill-Token"];
+// async function handleOrders(req, res) {
+//   if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
 
-  if (!BACKFILL_TOKEN || authToken !== BACKFILL_TOKEN) {
-    return res.status(401).json({ ok:false, error:"Unauthorized backfill" });
-  }
+//   const shop    = (req.query.shop || "").toLowerCase();
+//   const status  = (req.query.status || "").toLowerCase();
+//   const limit   = Math.min(Number(req.query.limit || 100), 1000);
+//   const refresh = String(req.query.refresh || "").toLowerCase() === "1";
 
-  const shop = String(req.query.shop || "").toLowerCase();
-  const from = String(req.query.from || "");
-  const to   = String(req.query.to   || "");
+//   const key = k(["orders", shop, status, limit]);
 
-  if (!shop || !from) {
-    return res.status(400).json({ ok:false, error:"Missing shop or from date" });
-  }
+//   try {
+//     const payload = await withCache({
+//       key,
+//       ttlMs: 45_000,
+//       tags: ["orders"],
+//       refresh,
+//       fetcher: async () => {
+//         const all = await getAll(process.env.TAB_ORDERS || "TBL_ORDER");
+//         let rows = shop ? all.filter(r => (r.SHOP_DOMAIN || "").toLowerCase() === shop) : all;
+//         if (status) rows = rows.filter(r => (r.FULFILLMENT_STATUS || "").toLowerCase() === status);
+//         rows.sort((a,b) => (a.UPDATED_AT < b.UPDATED_AT ? 1 : -1));
+//         return { ok:true, items: rows.slice(0, limit) };
+//       }
+//     });
 
-  const createdMin = new Date(from).toISOString();
-  const createdMax = to ? new Date(to).toISOString() : new Date().toISOString();
-
-  const { SHOPIFY_ADMIN_TOKEN } = process.env;
-  if (!SHOPIFY_ADMIN_TOKEN) {
-    return res.status(500).json({ ok:false, error:"Missing SHOPIFY_ADMIN_TOKEN" });
-  }
-
-  // lazy import to avoid bloating cold starts
-  const { normalizeOrderPayload } = await import("./lib/shopify.js");
-  const { upsertOrder, writeLineItems } = await import("./lib/sheets.js");
-
-  let urlPath =
-    `/orders.json?status=any&limit=250` +
-    `&order=created_at asc` +
-    `&created_at_min=${encodeURIComponent(createdMin)}` +
-    `&created_at_max=${encodeURIComponent(createdMax)}`;
-
-  let inserted = 0, updated = 0, skipped = 0, total = 0;
-
-  while (urlPath) {
-    const url = `https://${shop}/admin/api/2024-07${urlPath}`;
-    const resp = await fetch(url, {
-      headers: {
-        "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
-        "Content-Type": "application/json",
-      },
-    });
-
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => "");
-      return res.status(500).json({
-        ok:false,
-        error:`Shopify ${resp.status}: ${text.slice(0,500)}`
-      });
-    }
-
-    const data = await resp.json();
-    const orders = data.orders || [];
-    total += orders.length;
-
-    for (const raw of orders) {
-      const { order, lineItems } = normalizeOrderPayload(raw, shop);
-      const result = await upsertOrder(order);
-
-      if (result?.action === "inserted") inserted++;
-      else if (result?.action === "updated") updated++;
-      else skipped++;
-
-      if (Array.isArray(lineItems) && lineItems.length) {
-        await writeLineItems(lineItems, Date.now());
-      }
-    }
-
-    // pagination via Link header
-    const link = resp.headers.get("link") || resp.headers.get("Link") || "";
-    const match = link.match(/<([^>]+)>;\s*rel="next"/);
-    if (!match) {
-      urlPath = null;
-    } else {
-      const nextUrl = new URL(match[1]);
-      urlPath =
-        nextUrl.pathname.replace("/admin/api/2024-07", "") + nextUrl.search;
-    }
-  }
-
-  return res.status(200).json({
-    ok: true,
-    totalFetched: total,
-    inserted,
-    updated,
-    skipped,
-    from: createdMin,
-    to: createdMax,
-  });
-}
+//     setHttpCacheOk(res, 45);
+//     return res.status(200).json(payload);
+//   } catch (e) {
+//     // stale-on-error: if something still throws, give last cache or empty list
+//     const fallback = getCache(key) || { ok:true, items: [] };
+//     setHttpCacheOk(res, 15);
+//     return res.status(200).json(fallback);
+//   }
+// }
 async function handleSetDeliverBy(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ ok:false, error:"Method Not Allowed" });
@@ -304,7 +250,7 @@ async function handleOrdersPage(req, res) {
 async function handleOrders(req, res) {
   if (req.method !== "GET") {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
-    
+
   }
   const { getAll } = await import("./lib/sheets.js");
   const shop    = (req.query.shop || "").toLowerCase();
@@ -641,7 +587,7 @@ async function handleWebhookShopify(req, res) {
   const { enrichLineItemImages } = await import("./lib/shopify.js");
 
   let items = lineItems;
-  
+
   try { items = await enrichLineItemImages(shopDomain, items, SHOPIFY_ADMIN_TOKEN); }
   catch (e) { console.error("enrichLineItemImages:", e?.message || e); }
 
@@ -738,10 +684,73 @@ export default async function main(req, res) {
     res.status(500).json({ ok:false, error:String(e?.message || e) });
   }
 }
+
+// async function handleOrderTag(req, res) {
+//   if (req.method !== "POST") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
+
+//   const { SHOPIFY_ADMIN_TOKEN } = process.env;
+//   if (!SHOPIFY_ADMIN_TOKEN) return res.status(500).json({ ok:false, error:"Missing SHOPIFY_ADMIN_TOKEN" });
+
+//   const body = await readJsonBody(req);
+//   const shop = String(body.shop || "").toLowerCase();
+//   const orderId = String(body.orderId || "");
+//   const action = String(body.action || "add").toLowerCase();  // add | remove | set
+//   let tag = String(body.tag || "").trim();
+//   let tags = Array.isArray(body.tags) ? body.tags.map(s => String(s).trim()).filter(Boolean) : null;
+
+//   if (!shop || !orderId) return res.status(400).json({ ok:false, error:"Missing shop or orderId" });
+//   if (action !== "set" && !tag) return res.status(400).json({ ok:false, error:"Missing tag" });
+
+//   try {
+//     // 1) Read current order from Shopify to get existing tags
+//     const { getOrder, setOrderTags } = await import("./lib/shopify.js");
+//     const cur = await getOrder(shop, orderId, SHOPIFY_ADMIN_TOKEN);
+//     const currentTags = (cur?.tags || "")
+//       .split(",")
+//       .map(s => s.trim())
+//       .filter(Boolean);
+
+//     let nextTags = currentTags;
+
+//     if (action === "add") {
+//       if (!currentTags.includes(tag)) nextTags = [...currentTags, tag];
+//     } else if (action === "remove") {
+//       nextTags = currentTags.filter(t => t.toLowerCase() !== tag.toLowerCase());
+//     } else if (action === "set") {
+//       nextTags = (tags || []);
+//     }
+
+//     // 2) Write back to Shopify
+//     // const updated = await setOrderTags(shop, orderId, nextTags, SHOPIFY_ADMIN_TOKEN);
+
+//     // 3) Normalize + upsert to Sheets so UI reflects immediately (no webhook wait)
+//     const { normalizeOrderPayload } = await import("./lib/shopify.js");
+//     const { upsertOrder } = await import("./lib/sheets.js");
+
+//     // const { order } = normalizeOrderPayload(updated, shop);
+    
+//     order.TAGS = nextTags.join(', ');
+//     order.UPDATED_AT = new Date().toISOString();
+//     await upsertOrder(order);
+
+//     // 4) Bust caches
+//     try { invalidateByTag("orders"); } catch {}
+
+//     return res.status(200).json({ ok:true, tags: nextTags });
+//   } catch (e) {
+//     return res.status(500).json({ ok:false, error: e?.message || String(e) });
+//   }
+// }
 async function handleOrderTag(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
   }
+
+  // const { SHOPIFY_ADMIN_TOKEN } = process.env;
+  // if (!SHOPIFY_ADMIN_TOKEN) {
+  //   return res.status(500).json({ ok: false, error: "Missing SHOPIFY_ADMIN_TOKEN" });
+  // }
+
   const body = await readJsonBody(req);
   // const { readJsonBody } = await import("./lib/cors.js");
   const shop = String(body.shop || "").toLowerCase();
