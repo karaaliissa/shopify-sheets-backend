@@ -651,8 +651,6 @@ function extractPath(req) {
 const routes = new Map([
   ["",                async (req,res) => res.status(200).json({ ok:true, routes: Array.from(routes.keys()).filter(Boolean) })],
   ["orders",          handleOrders],
-  ["orders/summary",  handleOrdersSummary],
-  ["orders/page",     handleOrdersPage],
   ["items",           handleItems],
   ["order-items",     handleItems],
   ["export/shipday",  handleShipday],
