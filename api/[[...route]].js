@@ -291,17 +291,12 @@ async function handleOrders(req, res) {
 
 
 async function handleItems(req, res) {
-  if (req.method !== "GET") {
-    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
-  }
-
+  if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
+  const { getLatestItems } = await import("./lib/sheets.js");
   const shop    = (req.query.shop || "").toLowerCase();
   const orderId = String(req.query.order_id || "");
   const refresh = String(req.query.refresh || "").toLowerCase() === "1";
-
-  if (!shop || !orderId) {
-    return res.status(400).json({ ok: false, error: "Missing shop or order_id" });
-  }
+  if (!shop || !orderId) return res.status(400).json({ ok:false, error:"Missing shop or order_id" });
 
   const key = k(["items", shop, orderId]);
 
@@ -312,36 +307,15 @@ async function handleItems(req, res) {
       tags: [`items:${shop}`, `items:${shop}:${orderId}`],
       refresh,
       fetcher: async () => {
-        const { getAll, Tabs } = await import("./lib/sheets.js");
-
-        // 1) load all line items sheet
-        const all = await getAll(Tabs.ITEMS);
-
-        // 2) filter for this shop + order
-        const rowsForOrder = all.filter(r =>
-          String(r.SHOP_DOMAIN || "").toLowerCase() === shop &&
-          String(r.ORDER_ID || "") === orderId
-        );
-
-        // 3) keep only the latest batch (BATCH_TS) for that order
-        let latestTs = 0;
-        for (const it of rowsForOrder) {
-          const ts = Number(it.BATCH_TS || 0);
-          if (ts > latestTs) latestTs = ts;
-        }
-        const latestItems = latestTs
-          ? rowsForOrder.filter(it => Number(it.BATCH_TS || 0) === latestTs)
-          : rowsForOrder;
-
-        return { ok: true, items: latestItems };
+        const items = await getLatestItems(shop, orderId);
+        return { ok:true, items };
       }
     });
 
     setHttpCacheOk(res, 60);
     return res.status(200).json(payload);
   } catch (e) {
-    console.error("handleItems error:", e?.message || e);
-    const fallback = getCache(key) || { ok: true, items: [] };
+    const fallback = getCache(key) || { ok:true, items: [] };
     setHttpCacheOk(res, 15);
     return res.status(200).json(fallback);
   }
