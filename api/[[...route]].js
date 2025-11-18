@@ -1,14 +1,7 @@
 // /api/[...route].js
-// Unified router (robust) — keeps everything in one file.
-
 import getRawBody from "raw-body";
 import crypto from "crypto";
 import { setCors } from "./lib/cors.js";
-// import {
-//   getAll, getLatestItems, upsertOrder, writeLineItems, logWebhook,
-//   Tabs, createWorkEntry, markWorkDone
-// } from "./lib/sheets.js";
-// import { verifyShopifyHmac, normalizeOrderPayload, enrichLineItemImages } from "./lib/shopify.js";
 import { getCache, setCache, invalidateByTag, k } from "./lib/cache.js";
 
 export const config = { api: { bodyParser: false }, runtime: "nodejs" }; // important on Vercel
@@ -60,12 +53,6 @@ function exposeDownloadHeaders(res) {
   res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
 }
 
-// async function readJsonBody(req) {
-//   const raw = await getRawBody(req);
-//   try { return JSON.parse(raw.toString("utf8") || "{}"); }
-//   catch { return {}; }
-// }
-// /api/[...route].js
 async function readJsonBody(req) {
   const raw = await getRawBody(req);
   const s = raw.toString('utf8') || '';
@@ -80,41 +67,6 @@ function setHttpCacheOk(res, seconds = 30) {
 }
 
 // --- HANDLERS ---------------------------------------------------------------
-
-// async function handleOrders(req, res) {
-//   if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
-
-//   const shop    = (req.query.shop || "").toLowerCase();
-//   const status  = (req.query.status || "").toLowerCase();
-//   const limit   = Math.min(Number(req.query.limit || 100), 1000);
-//   const refresh = String(req.query.refresh || "").toLowerCase() === "1";
-
-//   const key = k(["orders", shop, status, limit]);
-
-//   try {
-//     const payload = await withCache({
-//       key,
-//       ttlMs: 45_000,
-//       tags: ["orders"],
-//       refresh,
-//       fetcher: async () => {
-//         const all = await getAll(process.env.TAB_ORDERS || "TBL_ORDER");
-//         let rows = shop ? all.filter(r => (r.SHOP_DOMAIN || "").toLowerCase() === shop) : all;
-//         if (status) rows = rows.filter(r => (r.FULFILLMENT_STATUS || "").toLowerCase() === status);
-//         rows.sort((a,b) => (a.UPDATED_AT < b.UPDATED_AT ? 1 : -1));
-//         return { ok:true, items: rows.slice(0, limit) };
-//       }
-//     });
-
-//     setHttpCacheOk(res, 45);
-//     return res.status(200).json(payload);
-//   } catch (e) {
-//     // stale-on-error: if something still throws, give last cache or empty list
-//     const fallback = getCache(key) || { ok:true, items: [] };
-//     setHttpCacheOk(res, 15);
-//     return res.status(200).json(fallback);
-//   }
-// }
 async function handleSetDeliverBy(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ ok:false, error:"Method Not Allowed" });
@@ -168,89 +120,11 @@ async function handleSetDeliverBy(req, res) {
     return res.status(500).json({ ok:false, error: e?.message || String(e) });
   }
 }
-async function handleOrdersSummary(req, res) {
-  if (req.method !== "GET") {
-    res.setHeader("Allow", "GET");
-    return res.status(405).json({ ok:false, error:"Method Not Allowed" });
-  }
-  const { getAll, Tabs } = await import("./lib/sheets.js");
-  const all = await getAll(Tabs.ORDERS);
-
-  // same canonical logic as UI
-  const statusOf = (r) => {
-    const tags = (r.TAGS || "").toLowerCase();
-    if (tags.includes("complete"))  return "complete";
-    if (tags.includes("cancel"))    return "cancel";
-    if (tags.includes("shipped"))   return "shipped";
-    if (tags.includes("processing"))return "processing";
-    const f = (r.FULFILLMENT_STATUS || "").toLowerCase();
-    if (!f || f === "open" || f === "unfulfilled") return "pending";
-    return "pending";
-  };
-  const isExpress = (r) => /\bexpress\b/i.test(String(r.SHIPPING_METHOD || ""));
-
-  const out = {
-    ok: true,
-    total: all.length,
-    pending: 0, processing: 0, shipped: 0, complete: 0, cancel: 0,
-    expressPending: 0, expressProcessing: 0, expressShipped: 0, expressComplete: 0, expressCancel: 0,
-  };
-
-  for (const r of all) {
-    const s = statusOf(r);
-    out[s] += 1;
-    if (isExpress(r)) {
-      if (s === "pending")     out.expressPending++;
-      else if (s === "processing") out.expressProcessing++;
-      else if (s === "shipped") out.expressShipped++;
-      else if (s === "complete")out.expressComplete++;
-      else if (s === "cancel") out.expressCancel++;
-    }
-  }
-
-  // tiny public cache
-  res.setHeader("Cache-Control", "public, max-age=5, s-maxage=30, stale-while-revalidate=60");
-  return res.status(200).json(out);
-}
-
-function encodeCursor(n) { return Buffer.from(String(n)).toString("base64"); }
-function decodeCursor(c) {
-  if (!c) return 0;
-  try { return Number(Buffer.from(String(c), "base64").toString("utf8")) || 0; }
-  catch { return 0; }
-}
-
-async function handleOrdersPage(req, res) {
-  if (req.method !== "GET") {
-    res.setHeader("Allow", "GET");
-    return res.status(405).json({ ok:false, error:"Method Not Allowed" });
-  }
-  const { getAll, Tabs } = await import("./lib/sheets.js");
-
-  const shop    = String(req.query.shop || "").toLowerCase();
-  const limit   = Math.min(Number(req.query.limit || 25), 100);
-  const cursor  = String(req.query.cursor || "");
-  const offset  = decodeCursor(cursor);
-
-  // load all then filter (Sheets doesn’t page natively)
-  let rows = await getAll(Tabs.ORDERS);
-  if (shop) rows = rows.filter(r => String(r.SHOP_DOMAIN || "").toLowerCase() === shop);
-
-  // sort newest first (match your UI)
-  rows.sort((a,b) => (a.CREATED_AT < b.CREATED_AT ? 1 : -1));
-
-  const total = rows.length;
-  const slice = rows.slice(offset, offset + limit);
-  const next  = offset + limit < total ? encodeCursor(offset + limit) : null;
-
-  res.setHeader("Cache-Control", "public, max-age=5, s-maxage=30, stale-while-revalidate=60");
-  return res.status(200).json({ ok:true, items: slice, nextCursor: next, total });
-}
 
 async function handleOrders(req, res) {
   if (req.method !== "GET") {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
-
+    
   }
   const { getAll } = await import("./lib/sheets.js");
   const shop    = (req.query.shop || "").toLowerCase();
@@ -264,8 +138,6 @@ async function handleOrders(req, res) {
     const all = await getAll(process.env.TAB_ORDERS || "TBL_ORDER");
     let rows = shop ? all.filter(r => (r.SHOP_DOMAIN || "").toLowerCase() === shop) : all;
     if (status) rows = rows.filter(r => (r.FULFILLMENT_STATUS || "").toLowerCase() === status);
-    // rows.sort((a, b) => (a.UPDATED_AT < b.UPDATED_AT ? 1 : -1));
-    // rows.sort((a, b) => Number(b.ORDER_ID) - Number(a.ORDER_ID));
     rows.sort((a, b) => (a.CREATED_AT < b.CREATED_AT ? 1 : -1));
     return { ok: true, items: rows.slice(0, limit) };
   };
@@ -320,7 +192,6 @@ async function handleItems(req, res) {
     return res.status(200).json(fallback);
   }
 }
-
 
 
 async function handleShipday(req, res) {
@@ -382,84 +253,7 @@ async function handleShipday(req, res) {
   res.setHeader("Content-Disposition", `attachment; filename="shipday-${dateQ}.csv"`);
   return res.status(200).send(csv);
 }
-// async function handlePickingListJson(req, res) {
-//   if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
-//   const shop = (req.query.shop || "").toLowerCase();
-//   const fromIso = req.query.from ? new Date(req.query.from) : null;
-//   const toIso   = req.query.to   ? new Date(req.query.to)   : null;
 
-//   const orders = await getAll(Tabs.ORDERS);
-//   const ordersFiltered = orders.filter(o => {
-//     if (shop && (o.SHOP_DOMAIN || "").toLowerCase() !== shop) return false;
-//     const t = new Date(o.CREATED_AT || o.UPDATED_AT || 0).getTime();
-//     if (fromIso && t < fromIso.getTime()) return false;
-//     if (toIso && t > toIso.getTime()) return false;
-//     return true;
-//   });
-
-//   const orderIdSet = new Set(ordersFiltered.map(o => String(o.ORDER_ID)));
-//   const orderNameById = new Map(
-//     ordersFiltered.map(o => [String(o.ORDER_ID), o.ORDER_NAME || `#${o.ORDER_ID}`])
-//   );
-//   const shipMethodById = new Map(
-//     ordersFiltered.map(o => [String(o.ORDER_ID), (o.SHIPPING_METHOD || "").toString()])
-//   );
-
-//   const itemsAll = await getAll(Tabs.ITEMS);
-//   const itemsForOrders = itemsAll.filter(r =>
-//     (!shop || (r.SHOP_DOMAIN || "").toLowerCase() === shop) && orderIdSet.has(String(r.ORDER_ID))
-//   );
-
-//   const latestBatchByOrder = new Map();
-//   for (const it of itemsForOrders) {
-//     const key = `${it.SHOP_DOMAIN}|${String(it.ORDER_ID)}`;
-//     const ts = Number(it.BATCH_TS || 0);
-//     if (!latestBatchByOrder.has(key) || ts > latestBatchByOrder.get(key)) latestBatchByOrder.set(key, ts);
-//   }
-//   const latestItems = itemsForOrders.filter(
-//     it => Number(it.BATCH_TS || 0) === latestBatchByOrder.get(`${it.SHOP_DOMAIN}|${String(it.ORDER_ID)}`)
-//   );
-
-//   // Group by item key, but keep per-order express info
-//   const byKey = new Map(); // key -> { …, ORDERS: Map<orderName, isExpress> }
-//   for (const it of latestItems) {
-//     const sku = (it.SKU || "").trim();
-//     const k = sku || `${it.TITLE || ""}|${it.VARIANT_TITLE || ""}`;
-//     const qty = Number(it.FULFILLABLE_QUANTITY ?? it.QUANTITY ?? 0);
-//     const orderId = String(it.ORDER_ID);
-//     const orderName = orderNameById.get(orderId) || `#${orderId}`;
-//     const method = shipMethodById.get(orderId) || "";
-//     const isExpress = /\bexpress\b/i.test(method);
-
-//     if (!byKey.has(k)) {
-//       byKey.set(k, {
-//         KEY: k,
-//         SKU: sku || "",
-//         TITLE: it.TITLE || "",
-//         VARIANT_TITLE: it.VARIANT_TITLE || "",
-//         IMAGE: it.IMAGE || "",
-//         TOTAL_QTY: 0,
-//         ORDERS: new Map() // name -> boolean (isExpress)
-//       });
-//     }
-
-//     const g = byKey.get(k);
-//     g.TOTAL_QTY += qty;
-//     g.IMAGE = g.IMAGE || it.IMAGE || "";
-//     // if same order name appears multiple times, keep TRUE if any line is express
-//     g.ORDERS.set(orderName, (g.ORDERS.get(orderName) || false) || isExpress);
-//   }
-
-//   const rows = Array.from(byKey.values())
-//     .map(g => ({
-//       ...g,
-//       ORDERS: Array.from(g.ORDERS.entries()).map(([NAME, IS_EXPRESS]) => ({ NAME, IS_EXPRESS }))
-//     }))
-//     .filter(x => x.TOTAL_QTY > 0)
-//     .sort((a, b) => b.TOTAL_QTY - a.TOTAL_QTY);
-
-//   return res.status(200).json({ ok: true, items: rows });
-// }
 async function handlePickingListJson(req, res) {
   if (req.method !== "GET") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
   const shop = (req.query.shop || "").toLowerCase();
@@ -588,7 +382,7 @@ async function handleWebhookShopify(req, res) {
   const { enrichLineItemImages } = await import("./lib/shopify.js");
 
   let items = lineItems;
-
+  
   try { items = await enrichLineItemImages(shopDomain, items, SHOPIFY_ADMIN_TOKEN); }
   catch (e) { console.error("enrichLineItemImages:", e?.message || e); }
 
@@ -659,13 +453,9 @@ const routes = new Map([
   ["orders/deliver-by", handleSetDeliverBy],
   ["picking-list",    handlePickingListJson],
   ["webhooks/shopify",handleWebhookShopify],
-  ["orders/tags",     handleOrderTag],
-  ["admin/backfill",  handleBackfill]
+  ["orders/tags",     handleOrderTag]
 ]);
 
-// export default async function main(req, res) {
-//   setCors(req, res);
-//   if (req.method === "OPTIONS") return res.status(204).end();
 export default async function main(req, res) {
   res.setHeader('x-handler', 'catchall:[...route].js');
 
@@ -684,71 +474,11 @@ export default async function main(req, res) {
   }
 }
 
-// async function handleOrderTag(req, res) {
-//   if (req.method !== "POST") return res.status(405).json({ ok:false, error:"Method Not Allowed" });
-
-//   const { SHOPIFY_ADMIN_TOKEN } = process.env;
-//   if (!SHOPIFY_ADMIN_TOKEN) return res.status(500).json({ ok:false, error:"Missing SHOPIFY_ADMIN_TOKEN" });
-
-//   const body = await readJsonBody(req);
-//   const shop = String(body.shop || "").toLowerCase();
-//   const orderId = String(body.orderId || "");
-//   const action = String(body.action || "add").toLowerCase();  // add | remove | set
-//   let tag = String(body.tag || "").trim();
-//   let tags = Array.isArray(body.tags) ? body.tags.map(s => String(s).trim()).filter(Boolean) : null;
-
-//   if (!shop || !orderId) return res.status(400).json({ ok:false, error:"Missing shop or orderId" });
-//   if (action !== "set" && !tag) return res.status(400).json({ ok:false, error:"Missing tag" });
-
-//   try {
-//     // 1) Read current order from Shopify to get existing tags
-//     const { getOrder, setOrderTags } = await import("./lib/shopify.js");
-//     const cur = await getOrder(shop, orderId, SHOPIFY_ADMIN_TOKEN);
-//     const currentTags = (cur?.tags || "")
-//       .split(",")
-//       .map(s => s.trim())
-//       .filter(Boolean);
-
-//     let nextTags = currentTags;
-
-//     if (action === "add") {
-//       if (!currentTags.includes(tag)) nextTags = [...currentTags, tag];
-//     } else if (action === "remove") {
-//       nextTags = currentTags.filter(t => t.toLowerCase() !== tag.toLowerCase());
-//     } else if (action === "set") {
-//       nextTags = (tags || []);
-//     }
-
-//     // 2) Write back to Shopify
-//     // const updated = await setOrderTags(shop, orderId, nextTags, SHOPIFY_ADMIN_TOKEN);
-
-//     // 3) Normalize + upsert to Sheets so UI reflects immediately (no webhook wait)
-//     const { normalizeOrderPayload } = await import("./lib/shopify.js");
-//     const { upsertOrder } = await import("./lib/sheets.js");
-
-//     // const { order } = normalizeOrderPayload(updated, shop);
-    
-//     order.TAGS = nextTags.join(', ');
-//     order.UPDATED_AT = new Date().toISOString();
-//     await upsertOrder(order);
-
-//     // 4) Bust caches
-//     try { invalidateByTag("orders"); } catch {}
-
-//     return res.status(200).json({ ok:true, tags: nextTags });
-//   } catch (e) {
-//     return res.status(500).json({ ok:false, error: e?.message || String(e) });
-//   }
-// }
 async function handleOrderTag(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
   }
 
-  // const { SHOPIFY_ADMIN_TOKEN } = process.env;
-  // if (!SHOPIFY_ADMIN_TOKEN) {
-  //   return res.status(500).json({ ok: false, error: "Missing SHOPIFY_ADMIN_TOKEN" });
-  // }
 
   const body = await readJsonBody(req);
   // const { readJsonBody } = await import("./lib/cors.js");
@@ -764,7 +494,7 @@ async function handleOrderTag(req, res) {
   try {
     // Read current tags from Sheets (cheap & immediate)
     const { getAll, upsertOrder } = await import("./lib/sheets.js");
-    const { invalidateByTag } = await import("./lib/cache.js");
+    // const { invalidateByTag } = await import("./lib/cache.js");
     const all = await getAll(process.env.TAB_ORDERS || "TBL_ORDER");
     const curRow = all.find(r =>
       String(r.SHOP_DOMAIN || "").toLowerCase() === shop &&
