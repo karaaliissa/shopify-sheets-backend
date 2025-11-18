@@ -660,6 +660,8 @@ const routes = new Map([
   ["picking-list",    handlePickingListJson],
   ["webhooks/shopify",handleWebhookShopify],
   ["orders/tags",     handleOrderTag],
+  ["orders/summary", handleOrdersSummary],
+  ["orders/page",    handleOrdersPage]
   // ["admin/backfill",  handleBackfill]
 ]);
 
