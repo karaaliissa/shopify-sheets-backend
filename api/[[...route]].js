@@ -790,7 +790,7 @@ async function handleOrderTag(req, res) {
   try {
     // Read current tags from Sheets (cheap & immediate)
     const { getAll, upsertOrder } = await import("./lib/sheets.js");
-    // const { invalidateByTag } = await import("./lib/cache.js");
+    const { invalidateByTag } = await import("./lib/cache.js");
     const all = await getAll(process.env.TAB_ORDERS || "TBL_ORDER");
     const curRow = all.find(r =>
       String(r.SHOP_DOMAIN || "").toLowerCase() === shop &&
