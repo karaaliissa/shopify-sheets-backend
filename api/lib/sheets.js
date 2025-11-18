@@ -142,19 +142,11 @@ export async function writeLineItems(items, batchTs) {
 
 export async function getLatestItems(shopDomain, orderId) {
   const all = await getAll(TAB_ITEMS);
-
-  const shopLc = String(shopDomain || "").toLowerCase();
-  const rows = all.filter(r =>
-    String(r.SHOP_DOMAIN || "").toLowerCase() === shopLc &&
-    String(r.ORDER_ID || "") === String(orderId)
-  );
-
+  const rows = all.filter(r => r.SHOP_DOMAIN === shopDomain && r.ORDER_ID === String(orderId));
   if (!rows.length) return [];
-
   const maxBatch = Math.max(...rows.map(r => Number(r.BATCH_TS || 0)));
-  return rows.filter(r => Number(r.BATCH_TS || 0) === maxBatch);
+  return rows.filter(r => Number(r.BATCH_TS) === maxBatch);
 }
-
 
 export async function logWebhook(entry) {
   await appendObjects(TAB_LOGS, [entry]);
