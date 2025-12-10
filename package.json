@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vercel dev",
-    "start": "node api/health.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "googleapis": "^127.0.0",
