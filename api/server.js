@@ -1,7 +1,7 @@
 // server.mjs
 import http from 'http';
 import main from './api/[...route].js';
-import webhookHandler from './api/webhooks/shopify.js';
+import webhookHandler from './webhooks/shopify.js';
 
 const server = http.createServer((req, res) => {
   // Webhook endpoint (Shopify admin → this URL)
