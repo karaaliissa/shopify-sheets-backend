@@ -4,12 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vercel dev",
     "start": "node server.js"
   },
   "dependencies": {
     "dotenv": "^17.2.3",
-    "googleapis": "^127.0.0",
     "nanoid": "^5.0.7",
     "pg": "^8.16.3",
     "raw-body": "^2.5.2"
