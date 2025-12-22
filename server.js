@@ -1,4 +1,6 @@
 // server.js
+import dotenv from "dotenv";
+dotenv.config();
 import http from 'http';
 
 // Catch-all router (for legacy routes like /api/orders, /api/items, /export/shipday, /picking-list, etc.)
@@ -134,3 +136,4 @@ const port = process.env.PORT || 3000;
 server.listen(port, () => {
   console.log('Backend listening on port', port);
 });
+console.log('DB:', process.env.DATABASE_URL ? 'OK' : 'MISSING');
