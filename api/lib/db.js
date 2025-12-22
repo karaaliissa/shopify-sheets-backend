@@ -136,22 +136,22 @@ export async function getOrderItems({ shopDomain, orderId } = {}) {
   if (!oid) return [];
 
   const sql = `
-    SELECT
-      title            AS "TITLE",
-      variant_title    AS "VARIANT_TITLE",
-      quantity         AS "QUANTITY",
-      fulfillable_quantity AS "FULFILLABLE_QUANTITY",
-      sku              AS "SKU",
-      image            AS "IMAGE",
-      unit_price       AS "UNIT_PRICE",
-      line_total       AS "LINE_TOTAL",
-      currency         AS "CURRENCY",
-      properties_json  AS "PROPERTIES_JSON"
-    FROM tbl_order_line_item
-    WHERE ($1 = '' OR lower(shop_domain) = $1)
-      AND order_id = $2
-    ORDER BY title ASC
-  `;
+  SELECT
+    title            AS "TITLE",
+    variant_title    AS "VARIANT_TITLE",
+    quantity         AS "QUANTITY",
+    fulfillable_quantity AS "FULFILLABLE_QUANTITY",
+    sku              AS "SKU",
+    image            AS "IMAGE",
+    unit_price       AS "UNIT_PRICE",
+    line_total       AS "LINE_TOTAL",
+    currency         AS "CURRENCY"
+  FROM tbl_order_line_item
+  WHERE ($1 = '' OR lower(shop_domain) = $1)
+    AND order_id = $2
+  ORDER BY title ASC
+`;
+
 
   const { rows } = await pool().query(sql, [shop, oid]);
   return rows;
@@ -285,19 +285,19 @@ export async function writeLineItems(items, batchTs) {
   );
 
   const sql = `
-    INSERT INTO tbl_order_line_item (
-      shop_domain, order_id,
-      title, variant_title, quantity, fulfillable_quantity,
-      sku, image, unit_price, line_total, currency, properties_json,
-      batch_ts
-    )
-    VALUES (
-      $1,$2,
-      $3,$4,$5,$6,
-      $7,$8,$9,$10,$11,$12,
-      $13
-    )
-  `;
+  INSERT INTO tbl_order_line_item (
+    shop_domain, order_id,
+    title, variant_title, quantity, fulfillable_quantity,
+    sku, image, unit_price, line_total, currency,
+    batch_ts
+  )
+  VALUES (
+    $1,$2,
+    $3,$4,$5,$6,
+    $7,$8,$9,$10,$11,
+    $12
+  )
+`;
 
   for (const it of items) {
     await pool().query(sql, [
@@ -312,7 +312,6 @@ export async function writeLineItems(items, batchTs) {
       it.unit_price,
       it.line_total,
       it.currency,
-      it.properties_json,
       batchTs,
     ]);
   }
