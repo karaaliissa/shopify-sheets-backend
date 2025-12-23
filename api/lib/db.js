@@ -354,7 +354,13 @@ export async function logWebhook(entry) {
   const sql = `
     INSERT INTO tbl_webhook_log (ts, shop_domain, topic, order_id, hash, result, error)
     VALUES ($1,$2,$3,$4,$5,$6,$7)
+    ON CONFLICT (shop_domain, topic, order_id, hash)
+    DO UPDATE SET
+      ts = EXCLUDED.ts,
+      result = EXCLUDED.result,
+      error = EXCLUDED.error
   `;
+
   await pool().query(sql, [
     entry.ts || new Date(),
     entry.shop_domain || null,
@@ -365,3 +371,4 @@ export async function logWebhook(entry) {
     entry.error || null,
   ]);
 }
+
