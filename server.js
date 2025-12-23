@@ -137,7 +137,14 @@ const server = http.createServer(async (req, res) => {
   if (p === "/" || p === "/health") return r.status(200).send("OK");
   if (p === "/api/ping") return handlePing(req, r);
   if (p === "/api/webhooks/shopify") return handleWebhookShopify(req, r);
-
+  if (p === "/debug/headers") {
+    return res.status(200).json({
+      ok: true,
+      method: req.method,
+      headers: req.headers,
+      query: req.query,
+    });
+  }
   return r.status(404).json({ ok: false, error: "Not Found" });
 });
 
