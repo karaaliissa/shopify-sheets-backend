@@ -63,9 +63,6 @@ async function handleWebhookShopify(req, res) {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
   }
 
-  const secret = String(process.env.SHOPIFY_WEBHOOK_SECRET || "").trim();
-  if (!secret) return res.status(500).json({ ok: false, error: "Missing SHOPIFY_WEBHOOK_SECRET" });
-
   const topic = String(req.headers["x-shopify-topic"] || "");
   const shopDomain = String(req.headers["x-shopify-shop-domain"] || "");
   const headerHmac = String(req.headers["x-shopify-hmac-sha256"] || "");
@@ -76,17 +73,33 @@ async function handleWebhookShopify(req, res) {
   } catch {
     return res.status(400).json({ ok: false, error: "Unable to read raw body" });
   }
-  console.log("HIT webhook", {
-    topic: req.headers["x-shopify-topic"],
-    shop: req.headers["x-shopify-shop-domain"],
-    hasHmac: !!req.headers["x-shopify-hmac-sha256"],
-    len: String(req.headers["x-shopify-hmac-sha256"] || "").length
-  });
-  
-  const ok = verifyShopifyHmac(raw, secret, headerHmac);
-  console.log("HMAC OK?", ok);
-  if (!ok) return res.status(401).json({ ok: false, error: "Invalid HMAC" });
 
+  // 🔥 Debug logs (always)
+  console.log("HIT webhook", {
+    topic,
+    shop: shopDomain,
+    hasHmac: !!headerHmac,
+    hmacLen: headerHmac.length,
+    rawLen: raw?.length || 0,
+  });
+
+  // ✅ DEBUG BYPASS (only if header matches env token)
+  const bypassToken = String(process.env.DEBUG_BYPASS_TOKEN || "").trim();
+  const gotBypass = String(req.headers["x-bypass-token"] || "").trim();
+  const bypass = bypassToken && gotBypass && gotBypass === bypassToken;
+
+  if (bypass) {
+    console.log("✅ DEBUG BYPASS ENABLED (skipping HMAC)");
+  } else {
+    const secret = String(process.env.SHOPIFY_WEBHOOK_SECRET || "").trim();
+    if (!secret) return res.status(500).json({ ok: false, error: "Missing SHOPIFY_WEBHOOK_SECRET" });
+
+    const ok = verifyShopifyHmac(raw, secret, headerHmac);
+    console.log("HMAC OK?", ok);
+    if (!ok) return res.status(401).json({ ok: false, error: "Invalid HMAC" });
+  }
+
+  // --- parse JSON ---
   let payload;
   try {
     payload = JSON.parse(raw.toString("utf8"));
