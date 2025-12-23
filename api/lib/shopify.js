@@ -84,7 +84,12 @@ export function normalizeOrderPayload(payload, shopDomain) {
 
   const order = {
     SHOP_DOMAIN: shopDomain,
-    ORDER_ID: String(o.id ?? ""),
+    ORDER_ID: String(
+      o.id ??
+      o.order_id ??
+      o.admin_graphql_api_id?.split("/").pop() ??
+      ""
+    ),
     ORDER_NAME: o.name ?? "",
     CREATED_AT: o.created_at ?? "",
     UPDATED_AT: o.updated_at ?? "",
