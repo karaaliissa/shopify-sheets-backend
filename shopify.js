@@ -1,26 +1,19 @@
 import crypto from "crypto";
 
 export function verifyShopifyHmac(rawBodyBuffer, secret, headerHmac) {
-  if (!secret || !headerHmac) return false;
+  if (!rawBodyBuffer || !secret || !headerHmac) return false;
 
-  const s = String(secret).trim();
+  const digest = crypto
+    .createHmac("sha256", String(secret).trim()) // ✅ use secret as UTF-8 string
+    .update(rawBodyBuffer)
+    .digest("base64");
 
-  // Shopify secret sometimes displayed as hex; accept both safely:
-  const key =
-    /^[0-9a-f]+$/i.test(s) && s.length % 2 === 0
-      ? Buffer.from(s, "hex")
-      : Buffer.from(s, "utf8");
+  const a = Buffer.from(digest, "utf8");
+  const b = Buffer.from(String(headerHmac).trim(), "utf8");
 
-  const digest = crypto.createHmac("sha256", key).update(rawBodyBuffer).digest("base64");
-
-  try {
-    // Important: headerHmac may include whitespace
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(String(headerHmac).trim()));
-  } catch {
-    return false;
-  }
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 }
-
 
 function normalizePhone(raw = "") {
   let s = String(raw || "").trim();
@@ -39,7 +32,9 @@ export function normalizeOrderPayload(payload, shopDomain) {
   const orderId =
     o.id ??
     o.order_id ??
-    (typeof o.admin_graphql_api_id === "string" ? o.admin_graphql_api_id.split("/").pop() : null) ??
+    (typeof o.admin_graphql_api_id === "string"
+      ? o.admin_graphql_api_id.split("/").pop()
+      : null) ??
     "";
 
   const order = {
@@ -61,7 +56,10 @@ export function normalizeOrderPayload(payload, shopDomain) {
     DELIVER_BY: null,
     SOURCE_NAME: (o.source_name ?? "")?.toString(),
     DISCOUNT_CODES: Array.isArray(o.discount_codes)
-      ? o.discount_codes.map(d => d?.code).filter(Boolean).join(",")
+      ? o.discount_codes
+          .map((d) => d?.code)
+          .filter(Boolean)
+          .join(",")
       : "",
     NOTE_LOCAL: null,
 
@@ -79,11 +77,14 @@ export function normalizeOrderPayload(payload, shopDomain) {
     ? o.line_items.map((li) => {
         const qty = Number(li.quantity ?? 0);
         const unit = Number(li.price_set?.shop_money?.amount ?? li.price ?? 0);
-        const currency = li.price_set?.shop_money?.currency_code ?? o.currency ?? "";
+        const currency =
+          li.price_set?.shop_money?.currency_code ?? o.currency ?? "";
 
         const lineId =
           String(li.id ?? "") ||
-          `no_line_id_${String(li.variant_id ?? li.product_id ?? li.title ?? "x").slice(0, 40)}`;
+          `no_line_id_${String(
+            li.variant_id ?? li.product_id ?? li.title ?? "x"
+          ).slice(0, 40)}`;
 
         return {
           SHOP_DOMAIN: order.SHOP_DOMAIN,
@@ -92,7 +93,9 @@ export function normalizeOrderPayload(payload, shopDomain) {
           TITLE: li.title ?? "",
           VARIANT_TITLE: li.variant_title ?? "",
           QUANTITY: qty,
-          FULFILLABLE_QUANTITY: Number(li.fulfillable_quantity ?? li.quantity ?? 0),
+          FULFILLABLE_QUANTITY: Number(
+            li.fulfillable_quantity ?? li.quantity ?? 0
+          ),
           SKU: li.sku ?? "",
           IMAGE: li?.image?.src ?? "",
           PRODUCT_ID: String(li.product_id ?? ""),

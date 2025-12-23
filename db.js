@@ -11,7 +11,9 @@ export function pool() {
 
   _pool = new Pool({
     connectionString: cs,
-    ssl: cs.includes("sslmode=require") ? { rejectUnauthorized: false } : undefined,
+    ssl: cs.includes("sslmode=require")
+      ? { rejectUnauthorized: false }
+      : undefined,
   });
 
   return _pool;
@@ -67,15 +69,33 @@ export async function upsertOrder(o) {
   `;
 
   const v = [
-    o.SHOP_DOMAIN, o.ORDER_ID, o.ORDER_NAME,
-    o.CREATED_AT, o.UPDATED_AT, o.CANCELLED_AT,
-    o.FULFILLMENT_STATUS, o.FINANCIAL_STATUS,
-    o.PAYMENT_GATEWAY, o.SHIPPING_METHOD,
-    o.TOTAL, o.CURRENCY, o.CUSTOMER_EMAIL, o.TAGS,
-    o.NOTE, o.DELIVER_BY,
-    o.SOURCE_NAME, o.DISCOUNT_CODES, o.NOTE_LOCAL,
-    o.SHIP_NAME, o.SHIP_ADDRESS1, o.SHIP_ADDRESS2, o.SHIP_CITY,
-    o.SHIP_PROVINCE, o.SHIP_ZIP, o.SHIP_COUNTRY, o.SHIP_PHONE
+    o.SHOP_DOMAIN,
+    o.ORDER_ID,
+    o.ORDER_NAME,
+    o.CREATED_AT,
+    o.UPDATED_AT,
+    o.CANCELLED_AT,
+    o.FULFILLMENT_STATUS,
+    o.FINANCIAL_STATUS,
+    o.PAYMENT_GATEWAY,
+    o.SHIPPING_METHOD,
+    o.TOTAL,
+    o.CURRENCY,
+    o.CUSTOMER_EMAIL,
+    o.TAGS,
+    o.NOTE,
+    o.DELIVER_BY,
+    o.SOURCE_NAME,
+    o.DISCOUNT_CODES,
+    o.NOTE_LOCAL,
+    o.SHIP_NAME,
+    o.SHIP_ADDRESS1,
+    o.SHIP_ADDRESS2,
+    o.SHIP_CITY,
+    o.SHIP_PROVINCE,
+    o.SHIP_ZIP,
+    o.SHIP_COUNTRY,
+    o.SHIP_PHONE,
   ];
 
   await pool().query(sql, v);
@@ -86,7 +106,10 @@ export async function replaceLineItems(shopDomain, orderId, items) {
   const oid = String(orderId || "").trim();
   if (!sd || !oid) return;
 
-  await pool().query(`DELETE FROM tbl_order_line_item WHERE shop_domain=$1 AND order_id=$2`, [sd, oid]);
+  await pool().query(
+    `DELETE FROM tbl_order_line_item WHERE shop_domain=$1 AND order_id=$2`,
+    [sd, oid]
+  );
 
   if (!Array.isArray(items) || items.length === 0) return;
 
@@ -108,7 +131,8 @@ export async function replaceLineItems(shopDomain, orderId, items) {
   `;
 
   for (const it of items) {
-    const lineId = String(it.LINE_ID || "").trim() || `no_line_id_${Date.now()}`;
+    const lineId =
+      String(it.LINE_ID || "").trim() || `no_line_id_${Date.now()}`;
     await pool().query(sql, [
       sd,
       oid,
