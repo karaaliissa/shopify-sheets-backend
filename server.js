@@ -1,9 +1,12 @@
-// server.js
 import dotenv from "dotenv";
 dotenv.config();
 
 import http from "http";
-import apiRouter from "./api/router.js";
+import crypto from "crypto";
+import getRawBody from "raw-body";
+
+import { pool, upsertOrder, replaceLineItems, logWebhook } from "./db.js";
+import { verifyShopifyHmac, normalizeOrderPayload } from "./shopify.js";
 
 function enhanceRes(res) {
   res.status = function (code) { this.statusCode = code; return this; };
@@ -16,40 +19,122 @@ function enhanceRes(res) {
   return res;
 }
 
-function attachQuery(req) {
-  try {
-    const host = req.headers.host || "local";
-    const url = new URL(req.url || "/", `http://${host}`);
-    req.query = Object.fromEntries(url.searchParams.entries());
-  } catch {
-    req.query = {};
-  }
+function pathOf(req) {
+  const host = req.headers.host || "local";
+  const url = new URL(req.url || "/", `http://${host}`);
+  req.query = Object.fromEntries(url.searchParams.entries());
+  return url.pathname || "/";
 }
 
-const server = http.createServer((req, res) => {
-  const r = enhanceRes(res);
-  attachQuery(req);
+function setCors(req, res) {
+  const origin = req.headers.origin;
+  const allowed = String(process.env.ALLOWED_ORIGINS || "")
+    .split(",").map(s => s.trim()).filter(Boolean);
 
-  const url = req.url || "";
-
-  if (url === "/" || url === "/health") {
-    r.statusCode = 200;
-    return r.end("OK");
+  if (origin) {
+    const ok = allowed.length === 0 || allowed.includes(origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Origin", ok ? origin : origin);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  } else {
+    res.setHeader("Access-Control-Allow-Origin", "*");
   }
 
-  if (url.startsWith("/api/")) {
-    apiRouter(req, r).catch((err) => {
-      console.error("API error:", err);
-      if (!r.headersSent) r.status(500).json({ ok: false, error: String(err?.message || err) });
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+  res.setHeader("Access-Control-Max-Age", "86400");
+
+  if (req.method === "OPTIONS") {
+    res.statusCode = 204;
+    res.end();
+    return true;
+  }
+  return false;
+}
+
+async function handlePing(req, res) {
+  const { rows } = await pool().query("select 1 as ok");
+  return res.status(200).json({ ok: rows?.[0]?.ok === 1 });
+}
+
+async function handleWebhookShopify(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  }
+
+  const secret = String(process.env.SHOPIFY_WEBHOOK_SECRET || "").trim();
+  if (!secret) return res.status(500).json({ ok: false, error: "Missing SHOPIFY_WEBHOOK_SECRET" });
+
+  const topic = String(req.headers["x-shopify-topic"] || "");
+  const shopDomain = String(req.headers["x-shopify-shop-domain"] || "");
+  const headerHmac = String(req.headers["x-shopify-hmac-sha256"] || "");
+
+  let raw;
+  try {
+    raw = await getRawBody(req);
+  } catch {
+    return res.status(400).json({ ok: false, error: "Unable to read raw body" });
+  }
+
+  const ok = verifyShopifyHmac(raw, secret, headerHmac);
+  if (!ok) return res.status(401).json({ ok: false, error: "Invalid HMAC" });
+
+  let payload;
+  try {
+    payload = JSON.parse(raw.toString("utf8"));
+  } catch {
+    return res.status(400).json({ ok: false, error: "Invalid JSON" });
+  }
+
+  const { order, lineItems } = normalizeOrderPayload(payload, shopDomain);
+
+  if (!order.SHOP_DOMAIN || !order.ORDER_ID) {
+    // do not crash; just skip
+    return res.status(200).json({ ok: true, skipped: true, reason: "Missing ORDER_ID/SHOP_DOMAIN" });
+  }
+
+  let errMsg = "";
+  try {
+    await upsertOrder(order);
+    await replaceLineItems(order.SHOP_DOMAIN, order.ORDER_ID, lineItems);
+  } catch (e) {
+    errMsg = e?.message || String(e);
+  }
+
+  // log webhook (never block response)
+  try {
+    const hash = crypto.createHash("sha256").update(raw).digest("hex").slice(0, 16);
+    await logWebhook({
+      ts: new Date().toISOString(),
+      shop_domain: shopDomain,
+      topic,
+      order_id: order.ORDER_ID,
+      hash,
+      result: errMsg ? "error" : "upsert",
+      error: errMsg || null,
     });
-    return;
-  }
+  } catch {}
 
-  r.statusCode = 404;
-  r.setHeader("Content-Type", "text/plain; charset=utf-8");
-  r.end("Not found");
+  if (errMsg) return res.status(500).json({ ok: false, error: errMsg });
+  return res.status(200).json({ ok: true, result: "upsert" });
+}
+
+const server = http.createServer(async (req, res) => {
+  const r = enhanceRes(res);
+  const p = pathOf(req);
+
+  if (setCors(req, r)) return;
+
+  if (p === "/" || p === "/health") return r.status(200).send("OK");
+  if (p === "/api/ping") return handlePing(req, r);
+  if (p === "/api/webhooks/shopify") return handleWebhookShopify(req, r);
+
+  return r.status(404).json({ ok: false, error: "Not Found" });
 });
 
 const port = process.env.PORT || 3000;
-server.listen(port, () => console.log("Backend listening on", port));
-console.log("DB:", process.env.DATABASE_URL ? "OK" : "MISSING");
+server.listen(port, () => {
+  console.log("Backend listening on", port);
+  console.log("DB:", process.env.DATABASE_URL ? "OK" : "MISSING");
+});
