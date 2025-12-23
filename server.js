@@ -76,8 +76,15 @@ async function handleWebhookShopify(req, res) {
   } catch {
     return res.status(400).json({ ok: false, error: "Unable to read raw body" });
   }
-
+  console.log("HIT webhook", {
+    topic: req.headers["x-shopify-topic"],
+    shop: req.headers["x-shopify-shop-domain"],
+    hasHmac: !!req.headers["x-shopify-hmac-sha256"],
+    len: String(req.headers["x-shopify-hmac-sha256"] || "").length
+  });
+  
   const ok = verifyShopifyHmac(raw, secret, headerHmac);
+  console.log("HMAC OK?", ok);
   if (!ok) return res.status(401).json({ ok: false, error: "Invalid HMAC" });
 
   let payload;
@@ -100,6 +107,7 @@ async function handleWebhookShopify(req, res) {
     await replaceLineItems(order.SHOP_DOMAIN, order.ORDER_ID, lineItems);
   } catch (e) {
     errMsg = e?.message || String(e);
+    console.error("DB WRITE ERROR:", errMsg);
   }
 
   // log webhook (never block response)

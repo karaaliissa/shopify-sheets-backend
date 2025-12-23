@@ -4,17 +4,23 @@ export function verifyShopifyHmac(rawBodyBuffer, secret, headerHmac) {
   if (!secret || !headerHmac) return false;
 
   const s = String(secret).trim();
-  const isHex = /^[0-9a-f]+$/i.test(s) && s.length % 2 === 0;
-  const key = isHex ? Buffer.from(s, "hex") : Buffer.from(s, "utf8");
+
+  // Shopify secret sometimes displayed as hex; accept both safely:
+  const key =
+    /^[0-9a-f]+$/i.test(s) && s.length % 2 === 0
+      ? Buffer.from(s, "hex")
+      : Buffer.from(s, "utf8");
 
   const digest = crypto.createHmac("sha256", key).update(rawBodyBuffer).digest("base64");
 
   try {
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(String(headerHmac)));
+    // Important: headerHmac may include whitespace
+    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(String(headerHmac).trim()));
   } catch {
     return false;
   }
 }
+
 
 function normalizePhone(raw = "") {
   let s = String(raw || "").trim();
