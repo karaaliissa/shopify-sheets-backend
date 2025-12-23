@@ -76,19 +76,17 @@ async function handleWebhookShopify(req, res) {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
   }
 
-  // 2) Read headers
+  // 2) Headers
   const topic = String(req.headers["x-shopify-topic"] || "").trim();
   const shopDomain = String(req.headers["x-shopify-shop-domain"] || "").trim();
   const headerHmac = String(req.headers["x-shopify-hmac-sha256"] || "").trim();
 
-  // 3) Only accept orders/create (ignore everything else)
-  // IMPORTANT: do this AFTER reading topic, but BEFORE DB work
+  // 3) Accept ONLY orders/create
   if (topic !== "orders/create") {
-    // Respond 200 so Shopify doesn't keep retrying
     return res.status(200).json({ ok: true, ignored: true, topic });
   }
 
-  // 4) Secret check
+  // 4) Secret
   const secret = String(process.env.SHOPIFY_WEBHOOK_SECRET || "").trim();
   if (!secret) {
     return res
@@ -101,7 +99,7 @@ async function handleWebhookShopify(req, res) {
     return res.status(401).json({ ok: false, error: "Missing HMAC header" });
   }
 
-  // 6) Read RAW body EXACTLY (Buffer)
+  // 6) Read RAW body (Buffer!)
   let raw;
   try {
     const lenHeader = req.headers["content-length"];
@@ -110,10 +108,9 @@ async function handleWebhookShopify(req, res) {
     raw = await getRawBody(req, {
       length: Number.isFinite(len) ? len : undefined,
       limit: "5mb",
-      encoding: null, // keep Buffer
+      encoding: null, // IMPORTANT: keep Buffer
     });
   } catch (e) {
-    console.error("RAW BODY READ ERROR:", e?.message || e);
     return res
       .status(400)
       .json({ ok: false, error: "Unable to read raw body" });
@@ -122,7 +119,6 @@ async function handleWebhookShopify(req, res) {
   // 7) Verify HMAC
   const ok = verifyShopifyHmac(raw, secret, headerHmac);
   if (!ok) {
-    // Return 401 so you know it failed verification
     return res.status(401).json({ ok: false, error: "Invalid HMAC" });
   }
 
@@ -134,21 +130,29 @@ async function handleWebhookShopify(req, res) {
     return res.status(400).json({ ok: false, error: "Invalid JSON" });
   }
 
-  // 9) Normalize payload into DB model
-  const { order, lineItems } = normalizeOrderPayload(payload, shopDomain);
+  // 9) 🔥 FILTER OLD ORDERS (important!)
+  const createdAt = new Date(payload?.created_at || 0).getTime();
+  const now = Date.now();
+  const maxAgeMs = 10 * 60 * 1000; // 10 minutes
 
-  // If missing identifiers, skip safely (don't crash Shopify)
-  if (!order?.SHOP_DOMAIN || !order?.ORDER_ID) {
+  if (!createdAt || now - createdAt > maxAgeMs) {
     return res
       .status(200)
-      .json({
-        ok: true,
-        skipped: true,
-        reason: "Missing ORDER_ID/SHOP_DOMAIN",
-      });
+      .json({ ok: true, ignored: true, reason: "old_order" });
   }
 
-  // 10) Write to DB
+  // 10) Normalize payload
+  const { order, lineItems } = normalizeOrderPayload(payload, shopDomain);
+
+  if (!order?.SHOP_DOMAIN || !order?.ORDER_ID) {
+    return res.status(200).json({
+      ok: true,
+      skipped: true,
+      reason: "Missing ORDER_ID/SHOP_DOMAIN",
+    });
+  }
+
+  // 11) DB transaction
   let errMsg = "";
   const client = await pool().connect();
 
@@ -169,35 +173,41 @@ async function handleWebhookShopify(req, res) {
     try {
       await client.query("ROLLBACK");
     } catch {}
-    console.error("TX DB ERROR:", errMsg);
   } finally {
     client.release();
   }
 
-  // 11) Log webhook (never block response)
+  // 12) Log webhook (non-blocking)
   try {
     const hash = crypto
       .createHash("sha256")
       .update(raw)
       .digest("hex")
       .slice(0, 16);
+
     await logWebhook({
       ts: new Date().toISOString(),
-      shop_domain: order.SHOP_DOMAIN || shopDomain,
+      shop_domain: order.SHOP_DOMAIN,
       topic,
       order_id: order.ORDER_ID,
       hash,
       result: errMsg ? "error" : "upsert",
       error: errMsg || null,
     });
-  } catch (e) {
-    // ignore logging errors
+  } catch {}
+
+  // 13) Response
+  if (errMsg) {
+    return res.status(500).json({ ok: false, error: errMsg });
   }
 
-  // 12) Respond
-  if (errMsg) return res.status(500).json({ ok: false, error: errMsg });
-  return res.status(200).json({ ok: true, result: "upsert" });
+  return res.status(200).json({
+    ok: true,
+    order_id: order.ORDER_ID,
+    items: lineItems.length,
+  });
 }
+
 
 const server = http.createServer(async (req, res) => {
   const r = enhanceRes(res);
