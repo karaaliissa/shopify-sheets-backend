@@ -6,16 +6,25 @@ import crypto from "crypto";
 /* ------------------------------------------------------------------ */
 export function verifyShopifyHmac(rawBodyBuffer, secret, headerHmac) {
   if (!secret || !headerHmac) return false;
+
+  // 🔥 Shopify secret is HEX → convert to bytes
+  const secretBuffer = Buffer.from(secret, "hex");
+
   const digest = crypto
-    .createHmac("sha256", secret)
-    .update(rawBodyBuffer, "utf8")
+    .createHmac("sha256", secretBuffer)
+    .update(rawBodyBuffer)
     .digest("base64");
+
   try {
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(headerHmac));
+    return crypto.timingSafeEqual(
+      Buffer.from(digest),
+      Buffer.from(headerHmac)
+    );
   } catch {
     return false;
   }
 }
+
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
