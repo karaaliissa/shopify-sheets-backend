@@ -19,7 +19,8 @@ export function pool() {
   return _pool;
 }
 
-export async function upsertOrder(o) {
+// ✅ same logic, but uses `client`
+export async function upsertOrderTx(client, o) {
   const sql = `
     INSERT INTO tbl_order (
       shop_domain, order_id, order_name,
@@ -98,15 +99,16 @@ export async function upsertOrder(o) {
     o.SHIP_PHONE,
   ];
 
-  await pool().query(sql, v);
+  await client.query(sql, v);
 }
 
-export async function replaceLineItems(shopDomain, orderId, items) {
+// ✅ transactional replace items
+export async function replaceLineItemsTx(client, shopDomain, orderId, items) {
   const sd = String(shopDomain || "").toLowerCase();
   const oid = String(orderId || "").trim();
   if (!sd || !oid) return;
 
-  await pool().query(
+  await client.query(
     `DELETE FROM tbl_order_line_item WHERE shop_domain=$1 AND order_id=$2`,
     [sd, oid]
   );
@@ -133,7 +135,7 @@ export async function replaceLineItems(shopDomain, orderId, items) {
   for (const it of items) {
     const lineId =
       String(it.LINE_ID || "").trim() || `no_line_id_${Date.now()}`;
-    await pool().query(sql, [
+    await client.query(sql, [
       sd,
       oid,
       lineId,

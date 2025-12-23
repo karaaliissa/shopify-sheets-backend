@@ -5,17 +5,24 @@ import http from "http";
 import crypto from "crypto";
 import getRawBody from "raw-body";
 
-import { pool, upsertOrder, replaceLineItems, logWebhook } from "./db.js";
+import { pool, upsertOrderTx, replaceLineItemsTx, logWebhook } from "./db.js";
 import { verifyShopifyHmac, normalizeOrderPayload } from "./shopify.js";
 
 function enhanceRes(res) {
-  res.status = function (code) { this.statusCode = code; return this; };
+  res.status = function (code) {
+    this.statusCode = code;
+    return this;
+  };
   res.json = function (obj) {
-    if (!this.headersSent) this.setHeader("Content-Type", "application/json; charset=utf-8");
+    if (!this.headersSent)
+      this.setHeader("Content-Type", "application/json; charset=utf-8");
     this.end(JSON.stringify(obj));
     return this;
   };
-  res.send = function (txt) { this.end(txt); return this; };
+  res.send = function (txt) {
+    this.end(txt);
+    return this;
+  };
   return res;
 }
 
@@ -29,7 +36,9 @@ function pathOf(req) {
 function setCors(req, res) {
   const origin = req.headers.origin;
   const allowed = String(process.env.ALLOWED_ORIGINS || "")
-    .split(",").map(s => s.trim()).filter(Boolean);
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 
   if (origin) {
     const ok = allowed.length === 0 || allowed.includes(origin);
@@ -41,7 +50,10 @@ function setCors(req, res) {
   }
 
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Requested-With"
+  );
   res.setHeader("Access-Control-Max-Age", "86400");
 
   if (req.method === "OPTIONS") {
@@ -79,7 +91,9 @@ async function handleWebhookShopify(req, res) {
   // 4) Secret check
   const secret = String(process.env.SHOPIFY_WEBHOOK_SECRET || "").trim();
   if (!secret) {
-    return res.status(500).json({ ok: false, error: "Missing SHOPIFY_WEBHOOK_SECRET" });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Missing SHOPIFY_WEBHOOK_SECRET" });
   }
 
   // 5) HMAC header must exist
@@ -100,7 +114,9 @@ async function handleWebhookShopify(req, res) {
     });
   } catch (e) {
     console.error("RAW BODY READ ERROR:", e?.message || e);
-    return res.status(400).json({ ok: false, error: "Unable to read raw body" });
+    return res
+      .status(400)
+      .json({ ok: false, error: "Unable to read raw body" });
   }
 
   // 7) Verify HMAC
@@ -123,22 +139,48 @@ async function handleWebhookShopify(req, res) {
 
   // If missing identifiers, skip safely (don't crash Shopify)
   if (!order?.SHOP_DOMAIN || !order?.ORDER_ID) {
-    return res.status(200).json({ ok: true, skipped: true, reason: "Missing ORDER_ID/SHOP_DOMAIN" });
+    return res
+      .status(200)
+      .json({
+        ok: true,
+        skipped: true,
+        reason: "Missing ORDER_ID/SHOP_DOMAIN",
+      });
   }
 
   // 10) Write to DB
   let errMsg = "";
+  const client = await pool().connect();
+
   try {
-    await upsertOrder(order);
-    await replaceLineItems(order.SHOP_DOMAIN, order.ORDER_ID, lineItems);
+    await client.query("BEGIN");
+
+    await upsertOrderTx(client, order);
+    await replaceLineItemsTx(
+      client,
+      order.SHOP_DOMAIN,
+      order.ORDER_ID,
+      lineItems
+    );
+
+    await client.query("COMMIT");
   } catch (e) {
     errMsg = e?.message || String(e);
-    console.error("DB WRITE ERROR:", errMsg);
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    console.error("TX DB ERROR:", errMsg);
+  } finally {
+    client.release();
   }
 
   // 11) Log webhook (never block response)
   try {
-    const hash = crypto.createHash("sha256").update(raw).digest("hex").slice(0, 16);
+    const hash = crypto
+      .createHash("sha256")
+      .update(raw)
+      .digest("hex")
+      .slice(0, 16);
     await logWebhook({
       ts: new Date().toISOString(),
       shop_domain: order.SHOP_DOMAIN || shopDomain,
@@ -156,7 +198,6 @@ async function handleWebhookShopify(req, res) {
   if (errMsg) return res.status(500).json({ ok: false, error: errMsg });
   return res.status(200).json({ ok: true, result: "upsert" });
 }
-
 
 const server = http.createServer(async (req, res) => {
   const r = enhanceRes(res);
