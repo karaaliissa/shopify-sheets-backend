@@ -7,6 +7,26 @@ import getRawBody from "raw-body";
 
 import { pool, upsertOrderTx, replaceLineItemsTx, logWebhook } from "./db.js";
 import { verifyShopifyHmac, normalizeOrderPayload } from "./shopify.js";
+async function handleOrdersFulfill(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  }
+
+  const f = await readForm(req);
+  const shop = String(f.shop || "").toLowerCase();
+  const orderId = String(f.orderId || "").trim();
+  if (!shop || !orderId) {
+    return res.status(400).json({ ok: false, error: "Missing shop/orderId" });
+  }
+
+  try {
+    const r1 = await fulfillOrderAllItems(shop, orderId);
+    return res.status(200).json({ ok: true, ...r1 });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+}
 
 function httpsReqJson(url, method = "GET", headers = {}, bodyObj) {
   return new Promise((resolve, reject) => {
@@ -777,6 +797,7 @@ const server = http.createServer(async (req, res) => {
   if (p === "/api/orders/tags") return handleOrdersTags(req, r);
   if (p === "/api/orders/deliver-by") return handleDeliverBy(req, r);
   if (p === "/api/orders/note-local") return handleNoteLocal(req, r);
+  if (p === "/api/orders/fulfill") return handleOrdersFulfill(req, r);
 
   return r.status(404).json({ ok: false, error: "Not Found" });
 });
