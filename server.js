@@ -43,7 +43,7 @@ function setCors(req, res) {
   if (origin) {
     const ok = allowed.length === 0 || allowed.includes(origin);
     res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Origin", ok ? origin : origin);
+    res.setHeader("Access-Control-Allow-Origin", ok ? origin : "null");
     res.setHeader("Access-Control-Allow-Credentials", "true");
   } else {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -52,8 +52,9 @@ function setCors(req, res) {
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Requested-With"
+    "Content-Type, Authorization, X-Requested-With, x-app-token"
   );
+
   res.setHeader("Access-Control-Max-Age", "86400");
 
   if (req.method === "OPTIONS") {
@@ -67,6 +68,312 @@ function setCors(req, res) {
 async function handlePing(req, res) {
   const { rows } = await pool().query("select 1 as ok");
   return res.status(200).json({ ok: rows?.[0]?.ok === 1 });
+}
+async function readForm(req) {
+  const raw = await getRawBody(req, { limit: "200kb", encoding: "utf8" });
+  return Object.fromEntries(new URLSearchParams(raw));
+}
+
+function encodeCursor(obj) {
+  return Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
+}
+function parseTags(tagsStr) {
+  if (!tagsStr) return [];
+  return String(tagsStr)
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+function serializeTags(tagsArr) {
+  // Shopify style: "A, B, C"
+  return (tagsArr || []).join(", ");
+}
+
+function titleCaseTag(s) {
+  // keeps "VIP" etc if already uppercase short
+  const x = String(s || "").trim();
+  if (!x) return "";
+  if (x.length <= 4 && x === x.toUpperCase()) return x;
+  return x
+    .split(/\s+/)
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1).toLowerCase() : ""))
+    .join(" ")
+    .trim();
+}
+
+function normalizeTagsForStore(tagsArr) {
+  // de-dupe case-insensitive, keep first canonical Title Case
+  const out = [];
+  const seen = new Set();
+  for (const raw of tagsArr || []) {
+    const t = titleCaseTag(raw);
+    const key = t.toLowerCase();
+    if (!t) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(t);
+  }
+  return out;
+}
+function normalizeTagName(tag) {
+  // Shopify tags are usually case-sensitive visually, بس نحنا بدنا نفس الformat عندك:
+  // "Processing, Shipped, Complete"
+  return String(tag || "").trim();
+}
+
+function joinTags(tagsArr) {
+  // keep your DB style: comma + space
+  return (tagsArr || []).filter(Boolean).join(", ");
+}
+
+async function handleOrdersSummary(req, res) {
+  const shop = String(req.query?.shop || "")
+    .toLowerCase()
+    .trim();
+  if (!shop) return res.status(400).json({ ok: false, error: "Missing shop" });
+
+  // tags format: "Processing, Shipped, Complete"
+  // نعدّهم بطريقة safe:
+  const { rows } = await pool().query(
+    `
+    SELECT
+      COUNT(*)::int AS total,
+      SUM(CASE WHEN (',' || LOWER(COALESCE(tags,'')) || ',') LIKE '%,processing,%' THEN 1 ELSE 0 END)::int AS processing,
+      SUM(CASE WHEN (',' || LOWER(COALESCE(tags,'')) || ',') LIKE '%,shipped,%' THEN 1 ELSE 0 END)::int AS shipped,
+      SUM(CASE WHEN (',' || LOWER(COALESCE(tags,'')) || ',') LIKE '%,complete,%' THEN 1 ELSE 0 END)::int AS complete
+    FROM tbl_order
+    WHERE shop_domain=$1
+    `,
+    [shop]
+  );
+
+  return res.status(200).json({ ok: true, shop, ...(rows?.[0] || {}) });
+}
+
+async function handleOrdersTags(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  }
+
+  const f = await readForm(req);
+  const shop = String(f.shop || "").toLowerCase();
+  const orderId = String(f.orderId || "").trim();
+  const action = String(f.action || "").toLowerCase(); // add/remove/set(optional)
+  const tagRaw = String(f.tag || "").trim();
+
+  if (!shop || !orderId) {
+    return res.status(400).json({ ok: false, error: "Missing shop/orderId" });
+  }
+  if (!tagRaw) {
+    return res.status(400).json({ ok: false, error: "Missing tag" });
+  }
+  if (action !== "add" && action !== "remove") {
+    return res.status(400).json({ ok: false, error: "Invalid action" });
+  }
+
+  const client = await pool().connect();
+  try {
+    await client.query("BEGIN");
+
+    const { rows } = await client.query(
+      `SELECT tags
+       FROM tbl_order
+       WHERE shop_domain=$1 AND order_id=$2
+       FOR UPDATE`,
+      [shop, orderId]
+    );
+
+    if (!rows?.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "Order not found" });
+    }
+
+    const currentTags = normalizeTagsForStore(parseTags(rows[0].tags));
+    const tag = titleCaseTag(tagRaw);
+    const key = tag.toLowerCase();
+
+    let nextTags = currentTags.slice();
+
+    if (action === "add") {
+      if (!nextTags.some((t) => t.toLowerCase() === key)) nextTags.push(tag);
+    } else if (action === "remove") {
+      nextTags = nextTags.filter((t) => t.toLowerCase() !== key);
+    }
+
+    nextTags = normalizeTagsForStore(nextTags);
+    const tagsStr = serializeTags(nextTags);
+
+    await client.query(
+      `UPDATE tbl_order
+       SET tags = NULLIF($3,'')
+       WHERE shop_domain=$1 AND order_id=$2`,
+      [shop, orderId, tagsStr]
+    );
+
+    await client.query("COMMIT");
+
+    return res.status(200).json({
+      ok: true,
+      shop,
+      order_id: orderId,
+      tags: nextTags, // array
+      tags_str: tagsStr, // string "A, B, C"
+    });
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  } finally {
+    client.release();
+  }
+}
+function decodeCursor(s) {
+  try {
+    return JSON.parse(Buffer.from(String(s), "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function handleOrdersPage(req, res) {
+  const { shop, status, limit, cursor, search } = req.query || {};
+  const pageSize = Math.min(
+    Math.max(parseInt(limit || "50", 10) || 50, 1),
+    200
+  );
+
+  const cur = cursor ? decodeCursor(cursor) : null;
+  const curUpdatedAt = cur?.updated_at || null;
+  const curOrderId = cur?.order_id || null;
+
+  const where = [];
+  const vals = [];
+  let i = 1;
+
+  if (shop) {
+    where.push(`shop_domain=$${i++}`);
+    vals.push(String(shop).toLowerCase());
+  }
+
+  // status filter (حسب tags أو fulfillment_status)
+  if (status && status !== "all") {
+    // أبسط حل: tags ILIKE
+    where.push(`(',' || LOWER(COALESCE(tags,'')) || ',') LIKE $${i++}`);
+    vals.push(`%,${String(status).toLowerCase()},%`);
+  }
+
+  if (search) {
+    const q = `%${String(search).toLowerCase()}%`;
+    where.push(`(
+      LOWER(COALESCE(order_name,'')) LIKE $${i++}
+      OR LOWER(COALESCE(customer_email,'')) LIKE $${i++}
+      OR LOWER(COALESCE(ship_name,'')) LIKE $${i++}
+      OR LOWER(COALESCE(order_id,'')) LIKE $${i++}
+    )`);
+    vals.push(q, q, q, q);
+  }
+
+  if (curUpdatedAt && curOrderId) {
+    where.push(`(
+      (updated_at < $${i++}::timestamp)
+      OR (updated_at = $${i++}::timestamp AND order_id < $${i++})
+    )`);
+    vals.push(curUpdatedAt, curUpdatedAt, String(curOrderId));
+  }
+
+  const wsql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+  const sql = `
+    SELECT *
+    FROM tbl_order
+    ${wsql}
+    ORDER BY COALESCE(updated_at, created_at) DESC NULLS LAST, order_id DESC
+
+    LIMIT $${i++}
+  `;
+  vals.push(pageSize + 1);
+
+  const { rows } = await pool().query(sql, vals);
+  const items = rows.slice(0, pageSize);
+
+  const next = rows.length > pageSize ? items[items.length - 1] : null;
+  const nextCursor = next
+    ? encodeCursor({ updated_at: next.updated_at, order_id: next.order_id })
+    : null;
+
+  return res.status(200).json({
+    ok: true,
+    items,
+    nextCursor,
+    total: undefined, // optional later
+  });
+}
+async function handleOrderItems(req, res) {
+  const shop = String(req.query?.shop || "").toLowerCase();
+  const orderId = String(req.query?.order_id || "").trim();
+  if (!shop || !orderId)
+    return res.status(400).json({ ok: false, error: "Missing shop/order_id" });
+
+  const { rows } = await pool().query(
+    `SELECT title as "TITLE",
+            variant_title as "VARIANT_TITLE",
+            quantity as "QUANTITY",
+            fulfillable_quantity as "FULFILLABLE_QUANTITY",
+            sku as "SKU",
+            image as "IMAGE",
+            unit_price as "UNIT_PRICE",
+            line_total as "LINE_TOTAL",
+            currency as "CURRENCY",
+            properties_json as "PROPERTIES_JSON"
+     FROM tbl_order_line_item
+     WHERE shop_domain=$1 AND order_id=$2
+     ORDER BY line_id ASC`,
+    [shop, orderId]
+  );
+
+  return res.status(200).json({ ok: true, items: rows || [] });
+}
+async function handleDeliverBy(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  }
+  const f = await readForm(req);
+  const shop = String(f.shop || "").toLowerCase();
+  const orderId = String(f.orderId || "").trim();
+  const deliverBy = String(f.deliverBy || "").trim(); // YYYY-MM-DD or ''
+
+  await pool().query(
+    `UPDATE tbl_order
+     SET deliver_by = NULLIF($3,'')::date
+     WHERE shop_domain=$1 AND order_id=$2`,
+    [shop, orderId, deliverBy]
+  );
+
+  return res.status(200).json({ ok: true, deliverBy: deliverBy || null });
+}
+
+async function handleNoteLocal(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  }
+  const f = await readForm(req);
+  const shop = String(f.shop || "").toLowerCase();
+  const orderId = String(f.orderId || "").trim();
+  const noteLocal = String(f.noteLocal || "").trim();
+
+  await pool().query(
+    `UPDATE tbl_order
+     SET note_local = NULLIF($3,'')
+     WHERE shop_domain=$1 AND order_id=$2`,
+    [shop, orderId, noteLocal]
+  );
+
+  return res.status(200).json({ ok: true, noteLocal: noteLocal || null });
 }
 
 async function handleWebhookShopify(req, res) {
@@ -208,7 +515,6 @@ async function handleWebhookShopify(req, res) {
   });
 }
 
-
 const server = http.createServer(async (req, res) => {
   const r = enhanceRes(res);
   const p = pathOf(req);
@@ -218,6 +524,12 @@ const server = http.createServer(async (req, res) => {
   if (p === "/" || p === "/health") return r.status(200).send("OK");
   if (p === "/api/ping") return handlePing(req, r);
   if (p === "/api/webhooks/shopify") return handleWebhookShopify(req, r);
+  if (p === "/api/orders/page") return handleOrdersPage(req, r);
+  if (p === "/api/order-items") return handleOrderItems(req, r);
+  if (p === "/api/orders/summary") return handleOrdersSummary(req, r);
+  if (p === "/api/orders/tags") return handleOrdersTags(req, r);
+  if (p === "/api/orders/deliver-by") return handleDeliverBy(req, r);
+  if (p === "/api/orders/note-local") return handleNoteLocal(req, r);
 
   return r.status(404).json({ ok: false, error: "Not Found" });
 });
