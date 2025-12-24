@@ -343,9 +343,13 @@ async function handleOrdersTags(req, res) {
   }
 
   const f = await readForm(req);
-  const shop = String(f.shop || "").toLowerCase();
+  const shop = String(f.shop || "")
+    .toLowerCase()
+    .trim();
   const orderId = String(f.orderId || "").trim();
-  const action = String(f.action || "").toLowerCase(); // add/remove/set(optional)
+  const action = String(f.action || "")
+    .toLowerCase()
+    .trim(); // add/remove
   const tagRaw = String(f.tag || "").trim();
 
   if (!shop || !orderId) {
@@ -359,9 +363,16 @@ async function handleOrdersTags(req, res) {
   }
 
   const client = await pool().connect();
+
+  // We’ll compute these so we can use them after COMMIT
+  let nextTags = [];
+  let tagsStr = "";
+  let normalized = "";
+
   try {
     await client.query("BEGIN");
 
+    // lock row
     const { rows } = await client.query(
       `SELECT tags
        FROM tbl_order
@@ -376,20 +387,28 @@ async function handleOrdersTags(req, res) {
     }
 
     const currentTags = normalizeTagsForStore(parseTags(rows[0].tags));
+
     const tag = titleCaseTag(tagRaw);
-    const key = tag.toLowerCase();
+    normalized = tag.toLowerCase();
 
-    let nextTags = currentTags.slice();
-
+    // Apply action
     if (action === "add") {
-      if (!nextTags.some((t) => t.toLowerCase() === key)) nextTags.push(tag);
-    } else if (action === "remove") {
-      nextTags = nextTags.filter((t) => t.toLowerCase() !== key);
+      if (!currentTags.some((t) => t.toLowerCase() === normalized)) {
+        currentTags.push(tag);
+      }
+    } else {
+      // remove
+      const beforeLen = currentTags.length;
+      nextTags = currentTags.filter((t) => t.toLowerCase() !== normalized);
+      // if nothing removed, keep as-is
+      if (nextTags.length === beforeLen) nextTags = currentTags.slice();
     }
 
-    nextTags = normalizeTagsForStore(nextTags);
-    const tagsStr = serializeTags(nextTags);
+    // normalize + serialize
+    nextTags = normalizeTagsForStore(nextTags.length ? nextTags : currentTags);
+    tagsStr = serializeTags(nextTags);
 
+    // Update DB tags
     await client.query(
       `UPDATE tbl_order
        SET tags = NULLIF($3,'')
@@ -398,41 +417,85 @@ async function handleOrdersTags(req, res) {
     );
 
     await client.query("COMMIT");
-    // after COMMIT (DB updated), trigger Shopify actions
-    try {
-      const normalized = tag.toLowerCase();
-
-      if (action === "add" && normalized === "shipped") {
-        // SHIPPED = Fulfilled
-        const r1 = await fulfillOrderAllItems(shop, orderId);
-        console.log("FULFILL RESULT", r1);
-      }
-
-      if (action === "add" && normalized === "complete") {
-        // COMPLETE = Mark as Paid
-        const r2 = await markOrderAsPaid(shop, orderId);
-        console.log("PAID RESULT", r2);
-      }
-    } catch (e) {
-      // ما بدنا نكسر response، بس بدنا نعرف شو صار
-      console.log("SHOPIFY ACTION ERROR", e?.message || String(e));
-    }
-    return res.status(200).json({
-      ok: true,
-      shop,
-      order_id: orderId,
-      tags: nextTags, // array
-      tags_str: tagsStr, // string "A, B, C"
-    });
   } catch (e) {
     try {
       await client.query("ROLLBACK");
     } catch {}
+    client.release();
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   } finally {
-    client.release();
+    try {
+      client.release();
+    } catch {}
   }
+
+  // ✅ AFTER COMMIT: trigger Shopify actions (do NOT block response if it fails)
+  (async () => {
+    try {
+      // Only when adding tag
+      if (action !== "add") return;
+
+      // ===== SHIPPED => fulfill =====
+      if (normalized === "shipped") {
+        // optional safety: check if already fulfilled
+        try {
+          const oUrl = `${shopifyBase(shop)}/orders/${orderId}.json`;
+          const o = await httpsReqJson(oUrl, "GET", {
+            "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          });
+
+          const fStatus = String(
+            o.json?.order?.fulfillment_status || ""
+          ).toLowerCase();
+
+          if (fStatus === "fulfilled") {
+            console.log("Already fulfilled, skip fulfill", {
+              orderId,
+              fStatus,
+            });
+          } else {
+            const r1 = await fulfillOrderAllItems(shop, orderId);
+            console.log("FULFILL RESULT", r1);
+          }
+        } catch (e) {
+          // if check fails, still attempt fulfill (or just log and stop)
+          console.log("FULFILL PRECHECK ERROR", e?.message || String(e));
+          const r1 = await fulfillOrderAllItems(shop, orderId);
+          console.log("FULFILL RESULT", r1);
+        }
+      }
+
+      // ===== COMPLETE => mark paid =====
+      if (normalized === "complete") {
+        // safety: skip if already paid
+        const oUrl = `${shopifyBase(shop)}/orders/${orderId}.json`;
+        const o = await httpsReqJson(oUrl, "GET", {
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+        });
+
+        const fin = String(o.json?.order?.financial_status || "").toLowerCase();
+        if (fin === "paid" || fin === "partially_paid") {
+          console.log("Already paid, skip mark paid", { orderId, fin });
+        } else {
+          const r2 = await markOrderAsPaid(shop, orderId);
+          console.log("PAID RESULT", r2);
+        }
+      }
+    } catch (e) {
+      console.log("SHOPIFY ACTION ERROR", e?.message || String(e));
+    }
+  })();
+
+  // ✅ Response immediately (DB updated already)
+  return res.status(200).json({
+    ok: true,
+    shop,
+    order_id: orderId,
+    tags: nextTags,
+    tags_str: tagsStr,
+  });
 }
+
 function decodeCursor(s) {
   try {
     return JSON.parse(Buffer.from(String(s), "base64url").toString("utf8"));
