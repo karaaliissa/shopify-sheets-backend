@@ -130,67 +130,68 @@ async function fulfillOrderAllItems(shopDomain, orderId) {
   return { ok: true, fulfillment_id: created.json?.fulfillment?.id || null };
 }
 
-async function markOrderAsPaid(shopDomain, orderId) {
+async function shopifyGraphql(shopDomain, query, variables) {
   const token = process.env.SHOPIFY_ADMIN_TOKEN;
   if (!token) throw new Error("Missing SHOPIFY_ADMIN_TOKEN");
 
-  // IMPORTANT:
-  // "Mark as paid" is basically creating a transaction.
-  // Sometimes "capture" works only if there's an authorization. For manual payment, "sale" usually works.
-  const txUrl = `${shopifyBase(
-    shopDomain
-  )}/orders/${orderId}/transactions.json`;
+  const url = `https://${shopDomain}/admin/api/2024-10/graphql.json`;
 
-  const payload = {
-    transaction: {
-      kind: "sale", // or "capture" depending on your gateway flow
-      status: "success",
-      // amount optional — Shopify may infer; if it fails, we fetch total and send it.
-    },
-  };
-
-  let r = await httpsReqJson(
-    txUrl,
+  const r = await httpsReqJson(
+    url,
     "POST",
     { "X-Shopify-Access-Token": token },
-    payload
+    { query, variables }
   );
-
-  // fallback: try with amount = total_price
-  if (!r.ok) {
-    const oUrl = `${shopifyBase(shopDomain)}/orders/${orderId}.json`;
-    const o = await httpsReqJson(oUrl, "GET", {
-      "X-Shopify-Access-Token": token,
-    });
-    const total = o.json?.order?.total_price;
-    if (!total)
-      throw new Error(
-        `Mark paid failed (${r.status}) and couldn't read total_price`
-      );
-
-    const payload2 = {
-      transaction: {
-        kind: "sale",
-        status: "success",
-        amount: String(total),
-        currency: o.json?.order?.currency || "USD",
-      },
-    };
-    r = await httpsReqJson(
-      txUrl,
-      "POST",
-      { "X-Shopify-Access-Token": token },
-      payload2
-    );
-  }
 
   if (!r.ok) {
     throw new Error(
-      `Mark as paid failed (${r.status}): ${String(r.data).slice(0, 200)}`
+      `GraphQL HTTP failed (${r.status}): ${String(r.data).slice(0, 300)}`
     );
   }
 
-  return { ok: true, transaction_id: r.json?.transaction?.id || null };
+  // GraphQL can return 200 with errors
+  if (r.json?.errors?.length) {
+    throw new Error(
+      `GraphQL errors: ${JSON.stringify(r.json.errors).slice(0, 300)}`
+    );
+  }
+
+  return r.json?.data;
+}
+
+// ✅ Mark as Paid (Manual Payment)
+async function markOrderAsPaid(shopDomain, orderId) {
+  // REST orderId is numeric. GraphQL wants a GID:
+  const orderGid = `gid://shopify/Order/${orderId}`;
+
+  const mutation = `
+    mutation MarkPaid($input: OrderCreateManualPaymentInput!) {
+      orderCreateManualPayment(input: $input) {
+        order { id displayFinancialStatus }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const variables = {
+    input: {
+      orderId: orderGid,
+      // amount: "10.00"  // ⚠️ partial amounts are Shopify Plus only (خليها فاضية لمعظم الستورات)
+    },
+  };
+
+  const data = await shopifyGraphql(shopDomain, mutation, variables);
+  const res = data?.orderCreateManualPayment;
+
+  if (res?.userErrors?.length) {
+    throw new Error(`Mark paid failed: ${JSON.stringify(res.userErrors)}`);
+  }
+
+  return {
+    ok: true,
+    order_id: orderId,
+    financial: res?.order?.displayFinancialStatus || null,
+  };
 }
 
 function enhanceRes(res) {
@@ -396,6 +397,8 @@ async function handleOrdersTags(req, res) {
       if (!currentTags.some((t) => t.toLowerCase() === normalized)) {
         currentTags.push(tag);
       }
+      // ✅ IMPORTANT: for add, nextTags must reflect currentTags
+      nextTags = currentTags.slice();
     } else {
       // remove
       const beforeLen = currentTags.length;
@@ -405,7 +408,7 @@ async function handleOrdersTags(req, res) {
     }
 
     // normalize + serialize
-    nextTags = normalizeTagsForStore(nextTags.length ? nextTags : currentTags);
+    nextTags = normalizeTagsForStore(nextTags);
     tagsStr = serializeTags(nextTags);
 
     // Update DB tags
@@ -421,7 +424,9 @@ async function handleOrdersTags(req, res) {
     try {
       await client.query("ROLLBACK");
     } catch {}
-    client.release();
+    try {
+      client.release();
+    } catch {}
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   } finally {
     try {
@@ -435,13 +440,20 @@ async function handleOrdersTags(req, res) {
       // Only when adding tag
       if (action !== "add") return;
 
+      // Admin token required
+      const token = process.env.SHOPIFY_ADMIN_TOKEN;
+      if (!token) {
+        console.log("SHOPIFY ACTION ERROR: Missing SHOPIFY_ADMIN_TOKEN");
+        return;
+      }
+
       // ===== SHIPPED => fulfill =====
       if (normalized === "shipped") {
         // optional safety: check if already fulfilled
         try {
           const oUrl = `${shopifyBase(shop)}/orders/${orderId}.json`;
           const o = await httpsReqJson(oUrl, "GET", {
-            "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+            "X-Shopify-Access-Token": token,
           });
 
           const fStatus = String(
@@ -458,7 +470,7 @@ async function handleOrdersTags(req, res) {
             console.log("FULFILL RESULT", r1);
           }
         } catch (e) {
-          // if check fails, still attempt fulfill (or just log and stop)
+          // if precheck fails, still attempt fulfill
           console.log("FULFILL PRECHECK ERROR", e?.message || String(e));
           const r1 = await fulfillOrderAllItems(shop, orderId);
           console.log("FULFILL RESULT", r1);
@@ -470,7 +482,7 @@ async function handleOrdersTags(req, res) {
         // safety: skip if already paid
         const oUrl = `${shopifyBase(shop)}/orders/${orderId}.json`;
         const o = await httpsReqJson(oUrl, "GET", {
-          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_TOKEN,
+          "X-Shopify-Access-Token": token,
         });
 
         const fin = String(o.json?.order?.financial_status || "").toLowerCase();
