@@ -311,6 +311,49 @@ async function handleOrdersPage(req, res) {
     total: undefined, // optional later
   });
 }
+function httpsGetJson(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const req = https.request(
+      {
+        hostname: u.hostname,
+        path: u.pathname + u.search,
+        method: "GET",
+        headers,
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            return resolve({ ok: false, status: res.statusCode, data });
+          }
+          try {
+            resolve({ ok: true, json: JSON.parse(data) });
+          } catch (e) {
+            resolve({ ok: false, status: res.statusCode, data });
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+async function fetchProductImage(shopDomain, productId) {
+  const token = process.env.SHOPIFY_ADMIN_TOKEN;
+  if (!token || !shopDomain || !productId) return null;
+
+  const url = `https://${shopDomain}/admin/api/2024-10/products/${productId}.json`;
+  const r = await httpsGetJson(url, { "X-Shopify-Access-Token": token });
+
+  if (!r.ok) return null;
+
+  const p = r.json?.product;
+  return p?.image?.src || p?.images?.[0]?.src || null;
+}
+
 async function handleOrderItems(req, res) {
   const shop = String(req.query?.shop || "").toLowerCase();
   const orderId = String(req.query?.order_id || "").trim();
@@ -467,6 +510,27 @@ async function handleWebhookShopify(req, res) {
     await client.query("BEGIN");
 
     await upsertOrderTx(client, order);
+    // enrich images (cache per product to avoid spam)
+    const imgCache = new Map();
+
+    for (const li of lineItems) {
+      if (String(li.IMAGE || "").trim()) continue; // ✅ treat empty string as missing
+      const pid = li.PRODUCT_ID;
+      if (!pid) continue;
+
+      if (!imgCache.has(pid)) {
+        imgCache.set(pid, fetchProductImage(order.SHOP_DOMAIN, pid));
+      }
+      li.IMAGE = await imgCache.get(pid);
+    }
+    console.log(
+      "IMG CHECK",
+      lineItems.map((x) => ({
+        pid: x.PRODUCT_ID,
+        img: (x.IMAGE || "").slice(0, 60),
+      }))
+    );
+
     await replaceLineItemsTx(
       client,
       order.SHOP_DOMAIN,
