@@ -159,77 +159,66 @@ async function shopifyGraphql(shopDomain, query, variables) {
   return r.json?.data;
 }
 
-// ✅ Mark as Paid (Manual Payment)
+// ✅ Mark as Paid (Manual Payment) — matches Shopify admin behavior
 async function markOrderAsPaid(shopDomain, orderId) {
   const token = process.env.SHOPIFY_ADMIN_TOKEN;
   if (!token) throw new Error("Missing SHOPIFY_ADMIN_TOKEN");
 
-  // 1) Read order (need amount/currency + verify current status)
+  // 1) fetch order to know current gateway name (and skip if already paid)
   const oUrl = `${shopifyBase(shopDomain)}/orders/${orderId}.json`;
   const o = await httpsReqJson(oUrl, "GET", { "X-Shopify-Access-Token": token });
+  if (!o.ok) throw new Error(`Order fetch failed (${o.status})`);
 
-  if (!o.ok) {
-    throw new Error(`Order fetch failed (${o.status}): ${String(o.data).slice(0, 200)}`);
-  }
-
-  const order = o.json?.order;
-  if (!order) throw new Error("Order missing in response");
-
-  const fin = String(order.financial_status || "").toLowerCase();
+  const fin = String(o.json?.order?.financial_status || "").toLowerCase();
   if (fin === "paid" || fin === "partially_paid") {
     return { ok: true, order_id: orderId, financial: fin, note: "Already paid" };
   }
 
-  // Shopify amounts are strings
-  const amount = String(order.total_price || order.current_total_price || "").trim();
-  const currency = String(order.currency || "USD").trim();
-
-  if (!amount) throw new Error("Order total_price missing");
-
-  // pick gateway if possible (else manual)
-  const gateway =
-    (Array.isArray(order.payment_gateway_names) && order.payment_gateway_names[0]) ||
+  // Shopify admin sends "Cash on Delivery (COD)" (as per your screenshot)
+  // We try to reproduce the same value.
+  const gatewayRaw =
+    (Array.isArray(o.json?.order?.payment_gateway_names) && o.json.order.payment_gateway_names[0]) ||
     "manual";
 
-  // 2) Create successful SALE transaction
-  const tUrl = `${shopifyBase(shopDomain)}/orders/${orderId}/transactions.json`;
+  const paymentMethodName =
+    /cash/i.test(gatewayRaw) ? "Cash on Delivery (COD)" : String(gatewayRaw);
 
-  const payload = {
-    transaction: {
-      kind: "sale",      // ✅ sale marks payment as received
-      status: "success", // ✅ success is what updates financial status
-      amount,
-      currency,
-      gateway,
-      // source: "external", // optional
-    },
-  };
+  const orderGid = `gid://shopify/Order/${orderId}`;
 
-  const tr = await httpsReqJson(
-    tUrl,
-    "POST",
-    { "X-Shopify-Access-Token": token },
-    payload
-  );
+  // 2) GraphQL mutation (public Admin API)
+  const mutation = `
+    mutation OrderCreateManualPayment($id: ID!, $paymentMethodName: String!) {
+      orderCreateManualPayment(id: $id, paymentMethodName: $paymentMethodName) {
+        order { id displayFinancialStatus }
+        userErrors { field message }
+      }
+    }
+  `;
 
-  if (!tr.ok) {
-    throw new Error(
-      `Transaction create failed (${tr.status}): ${String(tr.data).slice(0, 400)}`
-    );
+  const data = await shopifyGraphql(shopDomain, mutation, {
+    id: orderGid,
+    paymentMethodName,
+  });
+
+  const payload = data?.orderCreateManualPayment;
+  const errs = payload?.userErrors || [];
+  if (errs.length) {
+    throw new Error(`Mark paid failed: ${JSON.stringify(errs)}`);
   }
 
-  // 3) Verify
+  // 3) Verify by re-fetching REST order financial_status
   const v = await httpsReqJson(oUrl, "GET", { "X-Shopify-Access-Token": token });
   const fin2 = String(v.json?.order?.financial_status || "").toLowerCase();
 
   return {
     ok: true,
     order_id: orderId,
-    transaction_id: tr.json?.transaction?.id || null,
+    paymentMethodName,
     financial: fin2 || null,
-    gateway_used: gateway,
+    displayFinancialStatus: payload?.order?.displayFinancialStatus || null,
   };
 }
+
 
 function enhanceRes(res) {
   res.status = function (code) {
