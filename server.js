@@ -161,36 +161,73 @@ async function shopifyGraphql(shopDomain, query, variables) {
 
 // ✅ Mark as Paid (Manual Payment)
 async function markOrderAsPaid(shopDomain, orderId) {
-  // REST orderId is numeric. GraphQL wants a GID:
-  const orderGid = `gid://shopify/Order/${orderId}`;
+  const token = process.env.SHOPIFY_ADMIN_TOKEN;
+  if (!token) throw new Error("Missing SHOPIFY_ADMIN_TOKEN");
 
-  const mutation = `
-    mutation MarkPaid($input: OrderCreateManualPaymentInput!) {
-      orderCreateManualPayment(input: $input) {
-        order { id displayFinancialStatus }
-        userErrors { field message }
-      }
-    }
-  `;
+  // 1) Read order (need amount/currency + verify current status)
+  const oUrl = `${shopifyBase(shopDomain)}/orders/${orderId}.json`;
+  const o = await httpsReqJson(oUrl, "GET", { "X-Shopify-Access-Token": token });
 
-  const variables = {
-    input: {
-      orderId: orderGid,
-      // amount: "10.00"  // ⚠️ partial amounts are Shopify Plus only (خليها فاضية لمعظم الستورات)
+  if (!o.ok) {
+    throw new Error(`Order fetch failed (${o.status}): ${String(o.data).slice(0, 200)}`);
+  }
+
+  const order = o.json?.order;
+  if (!order) throw new Error("Order missing in response");
+
+  const fin = String(order.financial_status || "").toLowerCase();
+  if (fin === "paid" || fin === "partially_paid") {
+    return { ok: true, order_id: orderId, financial: fin, note: "Already paid" };
+  }
+
+  // Shopify amounts are strings
+  const amount = String(order.total_price || order.current_total_price || "").trim();
+  const currency = String(order.currency || "USD").trim();
+
+  if (!amount) throw new Error("Order total_price missing");
+
+  // pick gateway if possible (else manual)
+  const gateway =
+    (Array.isArray(order.payment_gateway_names) && order.payment_gateway_names[0]) ||
+    "manual";
+
+  // 2) Create successful SALE transaction
+  const tUrl = `${shopifyBase(shopDomain)}/orders/${orderId}/transactions.json`;
+
+  const payload = {
+    transaction: {
+      kind: "sale",      // ✅ sale marks payment as received
+      status: "success", // ✅ success is what updates financial status
+      amount,
+      currency,
+      gateway,
+      // source: "external", // optional
     },
   };
 
-  const data = await shopifyGraphql(shopDomain, mutation, variables);
-  const res = data?.orderCreateManualPayment;
+  const tr = await httpsReqJson(
+    tUrl,
+    "POST",
+    { "X-Shopify-Access-Token": token },
+    payload
+  );
 
-  if (res?.userErrors?.length) {
-    throw new Error(`Mark paid failed: ${JSON.stringify(res.userErrors)}`);
+  if (!tr.ok) {
+    throw new Error(
+      `Transaction create failed (${tr.status}): ${String(tr.data).slice(0, 400)}`
+    );
   }
+
+  // 3) Verify
+  const v = await httpsReqJson(oUrl, "GET", { "X-Shopify-Access-Token": token });
+  const fin2 = String(v.json?.order?.financial_status || "").toLowerCase();
 
   return {
     ok: true,
     order_id: orderId,
-    financial: res?.order?.displayFinancialStatus || null,
+    transaction_id: tr.json?.transaction?.id || null,
+    financial: fin2 || null,
+    gateway_used: gateway,
   };
 }
 
