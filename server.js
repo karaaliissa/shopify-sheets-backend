@@ -161,79 +161,42 @@ async function shopifyGraphql(shopDomain, query, variables) {
 
 // ✅ Mark as Paid (Manual Payment) — matches Shopify admin behavior
 async function markOrderAsPaid(shopDomain, orderId) {
-  const token = process.env.SHOPIFY_ADMIN_TOKEN;
-  if (!token) throw new Error("Missing SHOPIFY_ADMIN_TOKEN");
+  const gid = String(orderId || "").startsWith("gid://")
+    ? String(orderId)
+    : `gid://shopify/Order/${String(orderId).trim()}`;
 
-  const oUrl = `${shopifyBase(shopDomain)}/orders/${orderId}.json`;
-  const o = await httpsReqJson(oUrl, "GET", {
-    "X-Shopify-Access-Token": token,
-  });
-  if (!o.ok) {
+  const query = `
+    mutation orderMarkAsPaid($input: OrderMarkAsPaidInput!) {
+      orderMarkAsPaid(input: $input) {
+        userErrors { field message }
+        order {
+          id
+          name
+          canMarkAsPaid
+          displayFinancialStatus
+          totalOutstandingSet { shopMoney { amount currencyCode } }
+        }
+      }
+    }
+  `;
+
+  const data = await shopifyGraphql(shopDomain, query, { input: { id: gid } });
+
+  const payload = data?.orderMarkAsPaid;
+  const errs = payload?.userErrors || [];
+  if (errs.length) {
     throw new Error(
-      `Order fetch failed (${o.status}): ${String(o.data).slice(0, 200)}`
+      `orderMarkAsPaid failed: ${errs.map(e => e.message).join(" | ")}`
     );
   }
 
-  const order = o.json?.order;
-  const fin = String(order?.financial_status || "").toLowerCase();
-  if (fin === "paid" || fin === "partially_paid") {
-    return {
-      ok: true,
-      order_id: orderId,
-      financial: fin,
-      note: "Already paid",
-    };
-  }
-
-  const amount = String(
-    order.total_price || order.current_total_price || ""
-  ).trim();
-  const currency = String(order.currency || "USD").trim();
-  if (!amount) throw new Error("Order total_price missing");
-
-  const gateway =
-    (Array.isArray(order.payment_gateway_names) &&
-      order.payment_gateway_names[0]) ||
-    "manual";
-
-  const tUrl = `${shopifyBase(shopDomain)}/orders/${orderId}/transactions.json`;
-  const payload = {
-    transaction: {
-      kind: "sale",
-      status: "success",
-      amount,
-      currency,
-      gateway,
-    },
-  };
-
-  const tr = await httpsReqJson(
-    tUrl,
-    "POST",
-    { "X-Shopify-Access-Token": token },
-    payload
-  );
-
-  if (!tr.ok) {
-    throw new Error(
-      `Transaction create failed (${tr.status}): ${String(tr.data).slice(
-        0,
-        400
-      )}`
-    );
-  }
-
-  const v = await httpsReqJson(oUrl, "GET", {
-    "X-Shopify-Access-Token": token,
-  });
-  const fin2 = String(v.json?.order?.financial_status || "").toLowerCase();
-
+  const o = payload?.order;
   return {
     ok: true,
-    order_id: orderId,
-    transaction_id: tr.json?.transaction?.id || null,
-    financial: fin2 || null,
-    gateway_used: gateway,
+    order_gid: o?.id || gid,
+    order_name: o?.name || null,
+    financial: o?.displayFinancialStatus || null,
+    outstanding: o?.totalOutstandingSet?.shopMoney || null,
   };
 }
 
