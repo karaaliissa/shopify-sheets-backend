@@ -8,6 +8,171 @@ import getRawBody from "raw-body";
 import { pool, upsertOrderTx, replaceLineItemsTx, logWebhook } from "./db.js";
 import { verifyShopifyHmac, normalizeOrderPayload } from "./shopify.js";
 
+function httpsReqJson(url, method = "GET", headers = {}, bodyObj) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+
+    const body = bodyObj ? JSON.stringify(bodyObj) : null;
+
+    const req = https.request(
+      {
+        hostname: u.hostname,
+        path: u.pathname + u.search,
+        method,
+        headers: {
+          "Content-Type": "application/json",
+          ...(body ? { "Content-Length": Buffer.byteLength(body) } : {}),
+          ...headers,
+        },
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          const ok = res.statusCode >= 200 && res.statusCode < 300;
+          let parsed = null;
+          try {
+            parsed = data ? JSON.parse(data) : null;
+          } catch {}
+          resolve({ ok, status: res.statusCode, json: parsed, data });
+        });
+      }
+    );
+
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+function shopifyBase(shopDomain) {
+  // لازم يكون myshopify.com الأفضل
+  return `https://${shopDomain}/admin/api/2024-10`;
+}
+
+async function fulfillOrderAllItems(shopDomain, orderId) {
+  const token = process.env.SHOPIFY_ADMIN_TOKEN;
+  if (!token) throw new Error("Missing SHOPIFY_ADMIN_TOKEN");
+
+  // 1) get fulfillment_orders
+  const foUrl = `${shopifyBase(
+    shopDomain
+  )}/orders/${orderId}/fulfillment_orders.json`;
+  const fo = await httpsReqJson(foUrl, "GET", {
+    "X-Shopify-Access-Token": token,
+  });
+  if (!fo.ok) throw new Error(`Fulfillment orders fetch failed (${fo.status})`);
+
+  const fos = fo.json?.fulfillment_orders || [];
+  if (!fos.length) return { ok: true, message: "No fulfillment orders" };
+
+  // 2) build payload for ALL fulfillments
+  const line_items_by_fulfillment_order = fos
+    .map((x) => ({
+      fulfillment_order_id: x.id,
+      // fulfill ALL remaining quantities
+      fulfillment_order_line_items: (x.line_items || [])
+        .map((li) => ({
+          id: li.id,
+          quantity: li.remaining_quantity ?? li.quantity ?? 0,
+        }))
+        .filter((li) => li.quantity > 0),
+    }))
+    .filter((x) => x.fulfillment_order_line_items.length > 0);
+
+  if (!line_items_by_fulfillment_order.length) {
+    return { ok: true, message: "Nothing to fulfill (already fulfilled)" };
+  }
+
+  // 3) create fulfillment
+  const fUrl = `${shopifyBase(shopDomain)}/fulfillments.json`;
+  const payload = {
+    fulfillment: {
+      notify_customer: false,
+      line_items_by_fulfillment_order,
+    },
+  };
+
+  const created = await httpsReqJson(
+    fUrl,
+    "POST",
+    { "X-Shopify-Access-Token": token },
+    payload
+  );
+  if (!created.ok) {
+    throw new Error(
+      `Fulfillment create failed (${created.status}): ${String(
+        created.data
+      ).slice(0, 200)}`
+    );
+  }
+
+  return { ok: true, fulfillment_id: created.json?.fulfillment?.id || null };
+}
+
+async function markOrderAsPaid(shopDomain, orderId) {
+  const token = process.env.SHOPIFY_ADMIN_TOKEN;
+  if (!token) throw new Error("Missing SHOPIFY_ADMIN_TOKEN");
+
+  // IMPORTANT:
+  // "Mark as paid" is basically creating a transaction.
+  // Sometimes "capture" works only if there's an authorization. For manual payment, "sale" usually works.
+  const txUrl = `${shopifyBase(
+    shopDomain
+  )}/orders/${orderId}/transactions.json`;
+
+  const payload = {
+    transaction: {
+      kind: "sale", // or "capture" depending on your gateway flow
+      status: "success",
+      // amount optional — Shopify may infer; if it fails, we fetch total and send it.
+    },
+  };
+
+  let r = await httpsReqJson(
+    txUrl,
+    "POST",
+    { "X-Shopify-Access-Token": token },
+    payload
+  );
+
+  // fallback: try with amount = total_price
+  if (!r.ok) {
+    const oUrl = `${shopifyBase(shopDomain)}/orders/${orderId}.json`;
+    const o = await httpsReqJson(oUrl, "GET", {
+      "X-Shopify-Access-Token": token,
+    });
+    const total = o.json?.order?.total_price;
+    if (!total)
+      throw new Error(
+        `Mark paid failed (${r.status}) and couldn't read total_price`
+      );
+
+    const payload2 = {
+      transaction: {
+        kind: "sale",
+        status: "success",
+        amount: String(total),
+        currency: o.json?.order?.currency || "USD",
+      },
+    };
+    r = await httpsReqJson(
+      txUrl,
+      "POST",
+      { "X-Shopify-Access-Token": token },
+      payload2
+    );
+  }
+
+  if (!r.ok) {
+    throw new Error(
+      `Mark as paid failed (${r.status}): ${String(r.data).slice(0, 200)}`
+    );
+  }
+
+  return { ok: true, transaction_id: r.json?.transaction?.id || null };
+}
+
 function enhanceRes(res) {
   res.status = function (code) {
     this.statusCode = code;
@@ -213,7 +378,25 @@ async function handleOrdersTags(req, res) {
     );
 
     await client.query("COMMIT");
+    // after COMMIT (DB updated), trigger Shopify actions
+    try {
+      const normalized = tag.toLowerCase();
 
+      if (action === "add" && normalized === "shipped") {
+        // SHIPPED = Fulfilled
+        const r1 = await fulfillOrderAllItems(shop, orderId);
+        console.log("FULFILL RESULT", r1);
+      }
+
+      if (action === "add" && normalized === "complete") {
+        // COMPLETE = Mark as Paid
+        const r2 = await markOrderAsPaid(shop, orderId);
+        console.log("PAID RESULT", r2);
+      }
+    } catch (e) {
+      // ما بدنا نكسر response، بس بدنا نعرف شو صار
+      console.log("SHOPIFY ACTION ERROR", e?.message || String(e));
+    }
     return res.status(200).json({
       ok: true,
       shop,
