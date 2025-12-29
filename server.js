@@ -787,8 +787,16 @@ async function handleWebhookShopify(req, res) {
   const shopDomain = String(req.headers["x-shopify-shop-domain"] || "").trim();
   const headerHmac = String(req.headers["x-shopify-hmac-sha256"] || "").trim();
 
-  // 3) Accept ONLY orders/create
-  if (topic !== "orders/create") {
+  // 3) Allow only needed topics
+  const allowedTopics = new Set([
+    "orders/create",
+    "fulfillments/create",
+    "fulfillments/update",
+    "fulfillments/cancelled",
+  ]);
+
+
+  if (!allowedTopics.has(topic)) {
     return res.status(200).json({ ok: true, ignored: true, topic });
   }
 
@@ -836,103 +844,168 @@ async function handleWebhookShopify(req, res) {
     return res.status(400).json({ ok: false, error: "Invalid JSON" });
   }
 
-  // 9) 🔥 FILTER OLD ORDERS (important!)
-  const createdAt = new Date(payload?.created_at || 0).getTime();
-  const now = Date.now();
-  const maxAgeMs = 10 * 60 * 1000; // 10 minutes
+  // ========================
+  //  A) Fulfillment webhooks
+  // ========================
+  if (
+    topic === "fulfillments/create" ||
+    topic === "fulfillments/update" ||
+    topic === "fulfillments/cancelled"
+  ) {
+    const orderId = String(payload?.order_id || "").trim();
+    if (!shopDomain || !orderId) {
+      return res.status(200).json({ ok: true, skipped: true, reason: "missing shop/order_id", topic });
+    }
 
-  if (!createdAt || now - createdAt > maxAgeMs) {
-    return res
-      .status(200)
-      .json({ ok: true, ignored: true, reason: "old_order" });
+    const st = String(payload?.status || "").toLowerCase();
+    const shouldBeShipped = st ? st !== "cancelled" : topic !== "fulfillments/cancelled";
+
+    const client = await pool().connect();
+    try {
+      await client.query("BEGIN");
+      const out = await applyShippedFromShopify(client, shopDomain.toLowerCase(), orderId, shouldBeShipped);
+      await client.query("COMMIT");
+      return res.status(200).json({ ok: true, topic, orderId, ...out });
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch { }
+      return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    } finally {
+      client.release();
+    }
   }
 
-  // 10) Normalize payload
-  const { order, lineItems } = normalizeOrderPayload(payload, shopDomain);
 
-  if (!order?.SHOP_DOMAIN || !order?.ORDER_ID) {
+  // ========================
+  //  B) Orders/create webhook
+  // ========================
+  if (topic === "orders/create") {
+    // ✅ FILTER OLD ORDERS only here
+    const createdAt = new Date(payload?.created_at || 0).getTime();
+    const now = Date.now();
+    const maxAgeMs = 10 * 60 * 1000; // 10 minutes
+
+    if (!createdAt || now - createdAt > maxAgeMs) {
+      return res
+        .status(200)
+        .json({ ok: true, ignored: true, reason: "old_order" });
+    }
+
+    // ✅ Normalize payload ONLY for orders payload
+    const { order, lineItems } = normalizeOrderPayload(payload, shopDomain);
+
+    if (!order?.SHOP_DOMAIN || !order?.ORDER_ID) {
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "Missing ORDER_ID/SHOP_DOMAIN",
+      });
+    }
+
+    // DB transaction
+    let errMsg = "";
+    const client = await pool().connect();
+
+    try {
+      await client.query("BEGIN");
+
+      await upsertOrderTx(client, order);
+
+      // enrich images (cache per product to avoid spam)
+      const imgCache = new Map();
+
+      for (const li of lineItems) {
+        if (String(li.IMAGE || "").trim()) continue; // ✅ treat empty string as missing
+        const pid = li.PRODUCT_ID;
+        if (!pid) continue;
+
+        if (!imgCache.has(pid)) {
+          imgCache.set(pid, fetchProductImage(order.SHOP_DOMAIN, pid));
+        }
+        li.IMAGE = await imgCache.get(pid);
+      }
+
+      await replaceLineItemsTx(
+        client,
+        order.SHOP_DOMAIN,
+        order.ORDER_ID,
+        lineItems
+      );
+
+      await client.query("COMMIT");
+    } catch (e) {
+      errMsg = e?.message || String(e);
+      try {
+        await client.query("ROLLBACK");
+      } catch { }
+    } finally {
+      client.release();
+    }
+
+    // Log webhook (non-blocking)
+    try {
+      const hash = crypto
+        .createHash("sha256")
+        .update(raw)
+        .digest("hex")
+        .slice(0, 16);
+
+      await logWebhook({
+        ts: new Date().toISOString(),
+        shop_domain: order.SHOP_DOMAIN,
+        topic,
+        order_id: order.ORDER_ID,
+        hash,
+        result: errMsg ? "error" : "upsert",
+        error: errMsg || null,
+      });
+    } catch { }
+
+    if (errMsg) {
+      return res.status(500).json({ ok: false, error: errMsg });
+    }
+
     return res.status(200).json({
       ok: true,
-      skipped: true,
-      reason: "Missing ORDER_ID/SHOP_DOMAIN",
-    });
-  }
-
-  // 11) DB transaction
-  let errMsg = "";
-  const client = await pool().connect();
-
-  try {
-    await client.query("BEGIN");
-
-    await upsertOrderTx(client, order);
-    // enrich images (cache per product to avoid spam)
-    const imgCache = new Map();
-
-    for (const li of lineItems) {
-      if (String(li.IMAGE || "").trim()) continue; // ✅ treat empty string as missing
-      const pid = li.PRODUCT_ID;
-      if (!pid) continue;
-
-      if (!imgCache.has(pid)) {
-        imgCache.set(pid, fetchProductImage(order.SHOP_DOMAIN, pid));
-      }
-      li.IMAGE = await imgCache.get(pid);
-    }
-    console.log(
-      "IMG CHECK",
-      lineItems.map((x) => ({
-        pid: x.PRODUCT_ID,
-        img: (x.IMAGE || "").slice(0, 60),
-      }))
-    );
-
-    await replaceLineItemsTx(
-      client,
-      order.SHOP_DOMAIN,
-      order.ORDER_ID,
-      lineItems
-    );
-
-    await client.query("COMMIT");
-  } catch (e) {
-    errMsg = e?.message || String(e);
-    try {
-      await client.query("ROLLBACK");
-    } catch { }
-  } finally {
-    client.release();
-  }
-
-  // 12) Log webhook (non-blocking)
-  try {
-    const hash = crypto
-      .createHash("sha256")
-      .update(raw)
-      .digest("hex")
-      .slice(0, 16);
-
-    await logWebhook({
-      ts: new Date().toISOString(),
-      shop_domain: order.SHOP_DOMAIN,
-      topic,
       order_id: order.ORDER_ID,
-      hash,
-      result: errMsg ? "error" : "upsert",
-      error: errMsg || null,
+      items: lineItems.length,
     });
-  } catch { }
-
-  // 13) Response
-  if (errMsg) {
-    return res.status(500).json({ ok: false, error: errMsg });
   }
 
-  return res.status(200).json({
-    ok: true,
-    order_id: order.ORDER_ID,
-    items: lineItems.length,
-  });
+  // Should never reach here (topics are already filtered)
+  return res.status(200).json({ ok: true, ignored: true, topic });
+}
+
+async function applyShippedFromShopify(client, shop, orderId, shouldBeShipped) {
+  // lock row
+  const { rows } = await client.query(
+    `SELECT tags
+     FROM tbl_order
+     WHERE shop_domain=$1 AND order_id=$2
+     FOR UPDATE`,
+    [shop, orderId]
+  );
+
+  if (!rows?.length) return { ok: false, reason: "order_not_found" };
+
+  const current = normalizeTagsForStore(parseTags(rows[0].tags));
+  const hasShipped = current.some(t => t.toLowerCase() === "shipped");
+
+  let next = current.slice();
+
+  if (shouldBeShipped && !hasShipped) next.push("Shipped");
+  if (!shouldBeShipped && hasShipped) next = next.filter(t => t.toLowerCase() !== "shipped");
+
+  next = normalizeTagsForStore(next);
+  const tagsStr = serializeTags(next);
+
+  await client.query(
+    `UPDATE tbl_order
+     SET tags = NULLIF($3,'')
+     WHERE shop_domain=$1 AND order_id=$2`,
+    [shop, orderId, tagsStr]
+  );
+
+  return { ok: true, tags: next, tags_str: tagsStr };
 }
 
 const server = http.createServer(async (req, res) => {
