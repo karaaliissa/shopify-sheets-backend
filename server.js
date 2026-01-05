@@ -1011,6 +1011,7 @@ async function applyShippedFromShopify(client, shop, orderId, shouldBeShipped) {
 
   return { ok: true, tags: next, tags_str: tagsStr };
 }
+// ✅ Inventory Import (CSV streaming) — handles big files safely
 async function handleInventoryImport(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -1022,83 +1023,110 @@ async function handleInventoryImport(req, res) {
     return res.status(400).json({ ok: false, error: "Missing shop in query" });
   }
 
-  // read raw CSV body
-  const csvText = await getRawBody(req, { limit: "15mb", encoding: "utf8" });
-  if (!csvText || csvText.trim().length < 10) {
-    return res.status(400).json({ ok: false, error: "Empty CSV body" });
+  // Optional: only allow CSV-ish
+  const ct = String(req.headers["content-type"] || "").toLowerCase();
+  if (ct && !ct.includes("text/csv") && !ct.includes("application/csv") && !ct.includes("octet-stream")) {
+    // not blocking hard, but you can if you want:
+    // return res.status(415).json({ ok:false, error:"Content-Type must be text/csv" });
   }
 
-  // 1) Shopify variant lookup (handles Color/Size swaps + Material/Fabric)
-  const { lookup, makeKey } = await fetchVariantLookup(shop);
+  // ✅ Protect server: hard limit (you can raise it)
+  const MAX_BYTES = 80 * 1024 * 1024; // 80MB
+  let bytes = 0;
 
-  // 2) parse CSV (wide layout)
-  const rows = [];
-  const stream = Readable.from([csvText]);
-
-  await parseStockCsvStream(stream, (row) => rows.push(row));
-
-  // 3) aggregate qty per key
-  const agg = new Map();
-  for (const r of rows) {
-    const key = makeKey(r.title, r.color, r.size);
-    agg.set(key, (agg.get(key) || 0) + Number(r.qty || 0));
-  }
-
-  // 4) match
-  const items = [];
-  const unmatched = [];
-
-  for (const [key, qty] of agg.entries()) {
-    const v = lookup.get(key);
-    if (!v) {
-      const [t, c, s] = key.split("|");
-      unmatched.push({ product_title: t, color: c, size: s, qty });
-      continue;
+  // If client sends too much, kill request (prevents crash)
+  req.on("data", (chunk) => {
+    bytes += chunk.length;
+    if (bytes > MAX_BYTES) {
+      try { req.destroy(); } catch {}
     }
-    items.push({ variant_id: String(v.variant_id), qty: Number(qty || 0) });
-  }
-
-  // 5) upsert
-  let matched = 0;
-  const chunkSize = 500;
-
-  for (let i = 0; i < items.length; i += chunkSize) {
-    const chunk = items.slice(i, i + chunkSize);
-
-    const vals = [];
-    const params = [];
-    let p = 1;
-
-    for (const it of chunk) {
-      vals.push(`($${p++}, $${p++}, now())`);
-      params.push(String(it.variant_id), Number(it.qty));
-    }
-
-    const sql = `
-      insert into inventory_stock (variant_id, qty, updated_at)
-      values ${vals.join(",")}
-      on conflict (variant_id)
-      do update set qty = excluded.qty, updated_at = now()
-    `;
-
-    await pool().query(sql, params);
-    matched += chunk.length;
-  }
-
-  return res.status(200).json({
-    ok: true,
-    shop,
-    parsed_rows: rows.length,
-    unique_keys: agg.size,
-    matched,
-    unmatched_count: unmatched.length,
-    unmatched_sample: unmatched.slice(0, 50),
-    note:
-      unmatched.length
-        ? "Unmatched exist (usually naming differences). We'll add aliases UI later."
-        : "All matched ✅",
   });
+
+  try {
+    // 1) Shopify variant lookup (Color/Size swaps + Material/Fabric)
+    const { lookup, makeKey } = await fetchVariantLookup(shop);
+
+    // 2) Stream-parse CSV + aggregate on the fly (no rows[] in memory)
+    const agg = new Map();
+    let parsedRows = 0;
+
+    await parseStockCsvStream(req, (row) => {
+      parsedRows++;
+      const key = makeKey(row.title, row.color, row.size);
+      agg.set(key, (agg.get(key) || 0) + Number(row.qty || 0));
+    });
+
+    // 3) Match
+    const items = [];
+    const unmatched = [];
+
+    for (const [key, qty] of agg.entries()) {
+      const v = lookup.get(key);
+      if (!v) {
+        const [t, c, s] = key.split("|");
+        unmatched.push({ product_title: t, color: c, size: s, qty });
+        continue;
+      }
+      items.push({ variant_id: String(v.variant_id), qty: Number(qty || 0) });
+    }
+
+    // 4) Upsert to DB
+    let matched = 0;
+    const chunkSize = 500;
+
+    for (let i = 0; i < items.length; i += chunkSize) {
+      const chunk = items.slice(i, i + chunkSize);
+
+      const vals = [];
+      const params = [];
+      let p = 1;
+
+      for (const it of chunk) {
+        vals.push(`($${p++}, $${p++}, now())`);
+        params.push(String(it.variant_id), Number(it.qty));
+      }
+
+      const sql = `
+        insert into inventory_stock (variant_id, qty, updated_at)
+        values ${vals.join(",")}
+        on conflict (variant_id)
+        do update set qty = excluded.qty, updated_at = now()
+      `;
+
+      await pool().query(sql, params);
+      matched += chunk.length;
+    }
+
+    return res.status(200).json({
+      ok: true,
+      shop,
+      bytes_received: bytes,
+      parsed_rows: parsedRows,
+      unique_keys: agg.size,
+      matched,
+      unmatched_count: unmatched.length,
+      unmatched_sample: unmatched.slice(0, 50),
+      note:
+        unmatched.length
+          ? "Unmatched exist (usually naming differences). We'll add aliases UI later."
+          : "All matched ✅",
+    });
+  } catch (e) {
+    const msg = e?.message || String(e);
+
+    // ✅ If request destroyed بسبب الحجم
+    if (bytes > MAX_BYTES) {
+      return res.status(413).json({
+        ok: false,
+        error: `CSV too large. Max allowed is ${(MAX_BYTES / 1024 / 1024).toFixed(0)}MB`,
+        bytes_received: bytes,
+      });
+    }
+
+    return res.status(500).json({ ok: false, error: msg });
+  }
 }
+
 
 const server = http.createServer(async (req, res) => {
   const r = enhanceRes(res);
