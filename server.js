@@ -1036,6 +1036,7 @@ async function applyShippedFromShopify(client, shop, orderId, shouldBeShipped) {
   return { ok: true, tags: next, tags_str: tagsStr };
 }
 // ✅ Inventory Import (CSV streaming) — handles big files safely
+// ✅ Inventory Import (CSV streaming) — handles big files safely
 async function handleInventoryImport(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -1043,16 +1044,22 @@ async function handleInventoryImport(req, res) {
   }
 
   const shop = String(req.query?.shop || "").toLowerCase().trim();
-  if (!shop) return res.status(400).json({ ok: false, error: "Missing shop in query" });
+  if (!shop) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Missing shop in query" });
+  }
 
   // ✅ count bytes without buffering whole file
   let bytes = 0;
   const counter = new Transform({
     transform(chunk, enc, cb) {
       bytes += chunk.length;
-      cb(null, chunk); // IMPORTANT: pass-through
+      cb(null, chunk); // pass-through
     },
   });
+
+  // pipe request -> counter stream
   req.pipe(counter);
 
   // 1) Shopify variant lookup (your swap/material heuristics live here)
@@ -1062,32 +1069,60 @@ async function handleInventoryImport(req, res) {
   const agg = new Map(); // key => qty
 
   let parsedRows = 0;
-  let emitted = 0;
+  let emittedRows = 0;
 
   try {
+    // Parse CSV streaming
     const stats = await parseStockCsvStream(counter, (row) => {
-      emitted++;
+      emittedRows++;
+
+      // IMPORTANT: use makeKey exactly (no fuzzy changes)
       const key = makeKey(row.title, row.color, row.size);
-      agg.set(key, (agg.get(key) || 0) + Number(row.qty || 0));
+
+      const addQty = Number(row.qty || 0);
+      if (!Number.isFinite(addQty) || addQty <= 0) return;
+
+      agg.set(key, (agg.get(key) || 0) + addQty);
     });
 
     parsedRows = stats?.parsed || 0;
 
-    // 3) match
+    // 3) match keys -> variants
     const items = [];
     const unmatched = [];
 
     for (const [key, qty] of agg.entries()) {
       const v = lookup.get(key);
+
       if (!v) {
-        const [t, c, s] = key.split("|");
+        // key format expected: title|color|size
+        const parts = String(key).split("|");
+        const t = parts[0] || "";
+        const c = parts[1] || "";
+        const s = parts[2] || "";
         unmatched.push({ product_title: t, color: c, size: s, qty });
         continue;
       }
+
       items.push({ variant_id: String(v.variant_id), qty: Number(qty || 0) });
     }
 
-    // 4) upsert
+    // ✅ pretty text you can copy/paste
+    const unmatched_text = unmatched
+      .map(
+        (u, i) =>
+          `${i + 1}) ${u.product_title} | ${u.color} | ${u.size} | qty=${u.qty}`
+      )
+      .join("\n");
+
+    // ✅ CSV you can save quickly
+    const unmatched_csv =
+      "title,color,size,qty\n" +
+      unmatched
+        .map((u) => `${u.product_title},${u.color},${u.size},${u.qty}`)
+        .join("\n");
+
+    // 4) upsert inventory_stock
     let matched = 0;
     const chunkSize = 500;
 
@@ -1114,23 +1149,40 @@ async function handleInventoryImport(req, res) {
       matched += chunk.length;
     }
 
+    // ✅ return results
     return res.status(200).json({
       ok: true,
       shop,
       bytes_received: bytes || Number(req.headers["content-length"] || 0),
+
       csv_parser: stats,
       parsed_rows: parsedRows,
-      emitted_rows: emitted,
+      emitted_rows: emittedRows,
+
       unique_keys: agg.size,
       matched,
+
       unmatched_count: unmatched.length,
       unmatched_sample: unmatched.slice(0, 50),
-      note: unmatched.length ? "Unmatched exist (naming differences)." : "All matched ✅",
+
+      // ✅ extra outputs (truncate to avoid huge response)
+      unmatched_total_lines: unmatched.length,
+      unmatched_text: unmatched_text.slice(0, 8000),
+      unmatched_csv: unmatched_csv.slice(0, 8000),
+      unmatched_text_truncated: unmatched_text.length > 8000,
+      unmatched_csv_truncated: unmatched_csv.length > 8000,
+
+      note: unmatched.length
+        ? `Unmatched exist. See unmatched_text (count=${unmatched.length}).`
+        : "All matched ✅",
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return res
+      .status(500)
+      .json({ ok: false, error: e?.message || String(e) });
   }
 }
+
 
 
 const server = http.createServer(async (req, res) => {
