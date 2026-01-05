@@ -1036,7 +1036,6 @@ async function applyShippedFromShopify(client, shop, orderId, shouldBeShipped) {
   return { ok: true, tags: next, tags_str: tagsStr };
 }
 // ✅ Inventory Import (CSV streaming) — handles big files safely
-// ✅ Inventory Import (CSV streaming) — handles big files safely
 async function handleInventoryImport(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -1058,56 +1057,46 @@ async function handleInventoryImport(req, res) {
       cb(null, chunk); // pass-through
     },
   });
-
-  // pipe request -> counter stream
   req.pipe(counter);
 
   // 1) Shopify variant lookup (your swap/material heuristics live here)
   const { lookup, makeKey } = await fetchVariantLookup(shop);
 
-  // 2) aggregate ON THE FLY (no rows array)
+  // 2) aggregate ON THE FLY
   const agg = new Map(); // key => qty
-
   let parsedRows = 0;
-  let emittedRows = 0;
+  let emitted = 0;
 
   try {
-    // Parse CSV streaming
     const stats = await parseStockCsvStream(counter, (row) => {
-      emittedRows++;
-
-      // IMPORTANT: use makeKey exactly (no fuzzy changes)
+      emitted++;
       const key = makeKey(row.title, row.color, row.size);
-
-      const addQty = Number(row.qty || 0);
-      if (!Number.isFinite(addQty) || addQty <= 0) return;
-
-      agg.set(key, (agg.get(key) || 0) + addQty);
+      agg.set(key, (agg.get(key) || 0) + Number(row.qty || 0));
     });
 
     parsedRows = stats?.parsed || 0;
 
-    // 3) match keys -> variants
+    // 3) match
     const items = [];
     const unmatched = [];
 
     for (const [key, qty] of agg.entries()) {
       const v = lookup.get(key);
-
       if (!v) {
-        // key format expected: title|color|size
-        const parts = String(key).split("|");
-        const t = parts[0] || "";
-        const c = parts[1] || "";
-        const s = parts[2] || "";
-        unmatched.push({ product_title: t, color: c, size: s, qty });
+        const [t, c, s] = key.split("|");
+        unmatched.push({
+          product_title: t || "",
+          color: c || "",
+          size: s || "",
+          qty: Number(qty || 0),
+          key,
+        });
         continue;
       }
-
       items.push({ variant_id: String(v.variant_id), qty: Number(qty || 0) });
     }
 
-    // ✅ pretty text you can copy/paste
+    // ✅ build helpful outputs
     const unmatched_text = unmatched
       .map(
         (u, i) =>
@@ -1115,14 +1104,20 @@ async function handleInventoryImport(req, res) {
       )
       .join("\n");
 
-    // ✅ CSV you can save quickly
     const unmatched_csv =
       "title,color,size,qty\n" +
       unmatched
         .map((u) => `${u.product_title},${u.color},${u.size},${u.qty}`)
         .join("\n");
 
-    // 4) upsert inventory_stock
+    // ✅ Excel-friendly (tab-separated)
+    const unmatched_tsv =
+      "title\tcolor\tsize\tqty\n" +
+      unmatched
+        .map((u) => `${u.product_title}\t${u.color}\t${u.size}\t${u.qty}`)
+        .join("\n");
+
+    // 4) upsert matched inventory
     let matched = 0;
     const chunkSize = 500;
 
@@ -1149,39 +1144,37 @@ async function handleInventoryImport(req, res) {
       matched += chunk.length;
     }
 
-    // ✅ return results
     return res.status(200).json({
       ok: true,
       shop,
       bytes_received: bytes || Number(req.headers["content-length"] || 0),
-
       csv_parser: stats,
       parsed_rows: parsedRows,
-      emitted_rows: emittedRows,
-
+      emitted_rows: emitted,
       unique_keys: agg.size,
       matched,
-
       unmatched_count: unmatched.length,
+
+      // keep small sample
       unmatched_sample: unmatched.slice(0, 50),
 
-      // ✅ extra outputs (truncate to avoid huge response)
-      unmatched_total_lines: unmatched.length,
-      unmatched_text: unmatched_text.slice(0, 8000),
-      unmatched_csv: unmatched_csv.slice(0, 8000),
-      unmatched_text_truncated: unmatched_text.length > 8000,
-      unmatched_csv_truncated: unmatched_csv.length > 8000,
+      // ✅ best for you
+      unmatched_text: unmatched_text.slice(0, 15000),
+      unmatched_csv: unmatched_csv.slice(0, 15000),
+      unmatched_tsv: unmatched_tsv.slice(0, 15000),
+
+      // ✅ full structured for scripts
+      unmatched_json: unmatched.slice(0, 500), // (optional cap)
 
       note: unmatched.length
-        ? `Unmatched exist. See unmatched_text (count=${unmatched.length}).`
+        ? `Unmatched exist. Use unmatched_text / unmatched_tsv (count=${unmatched.length}).`
         : "All matched ✅",
     });
   } catch (e) {
-    return res
-      .status(500)
-      .json({ ok: false, error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 }
+
 
 
 
