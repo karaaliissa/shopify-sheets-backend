@@ -1042,85 +1042,87 @@ async function handleInventoryImport(req, res) {
   }
 
   const shop = String(req.query?.shop || "").toLowerCase().trim();
-  if (!shop) {
-    return res.status(400).json({ ok: false, error: "Missing shop in query" });
-  }
+  if (!shop) return res.status(400).json({ ok: false, error: "Missing shop in query" });
 
-  // ✅ read ONCE as Buffer (do NOT parse from req after this)
-  const raw = await getRawBody(req, { limit: "60mb", encoding: null });
-  const bytes = raw?.length || 0;
+  // ✅ count bytes without buffering whole file
+  let bytes = 0;
+  req.on("data", (chunk) => (bytes += chunk.length));
 
-  if (!raw || bytes < 10) {
-    return res.status(400).json({ ok: false, error: "Empty CSV body" });
-  }
-
-  // 1) Shopify variant lookup (handles Color/Size swaps + Material/Fabric)
+  // 1) Shopify variant lookup (your swap/material heuristics live here)
   const { lookup, makeKey } = await fetchVariantLookup(shop);
 
-  // 2) parse CSV from buffer (NOT from req)
-  const rows = [];
-  const stream = Readable.from([raw]); // ✅ key fix
+  // 2) aggregate ON THE FLY (no rows array)
+  const agg = new Map(); // key => qty
 
-  const csvStats = await parseStockCsvStream(stream, (row) => rows.push(row));
+  let parsedRows = 0;
+  let emitted = 0;
 
-  // 3) aggregate
-  const agg = new Map();
-  for (const r of rows) {
-    const key = makeKey(r.title, r.color, r.size);
-    agg.set(key, (agg.get(key) || 0) + Number(r.qty || 0));
-  }
+  try {
+    const stats = await parseStockCsvStream(req, (row) => {
+      emitted++;
+      const key = makeKey(row.title, row.color, row.size);
+      agg.set(key, (agg.get(key) || 0) + Number(row.qty || 0));
+    });
 
-  // 4) match
-  const items = [];
-  const unmatched = [];
-  for (const [key, qty] of agg.entries()) {
-    const v = lookup.get(key);
-    if (!v) {
-      const [t, c, s] = key.split("|");
-      unmatched.push({ product_title: t, color: c, size: s, qty });
-      continue;
-    }
-    items.push({ variant_id: String(v.variant_id), qty: Number(qty || 0) });
-  }
+    parsedRows = stats?.parsed || 0;
 
-  // 5) upsert
-  let matched = 0;
-  const chunkSize = 500;
+    // 3) match
+    const items = [];
+    const unmatched = [];
 
-  for (let i = 0; i < items.length; i += chunkSize) {
-    const chunk = items.slice(i, i + chunkSize);
-
-    const vals = [];
-    const params = [];
-    let p = 1;
-
-    for (const it of chunk) {
-      vals.push(`($${p++}, $${p++}, now())`);
-      params.push(String(it.variant_id), Number(it.qty));
+    for (const [key, qty] of agg.entries()) {
+      const v = lookup.get(key);
+      if (!v) {
+        const [t, c, s] = key.split("|");
+        unmatched.push({ product_title: t, color: c, size: s, qty });
+        continue;
+      }
+      items.push({ variant_id: String(v.variant_id), qty: Number(qty || 0) });
     }
 
-    const sql = `
-      insert into inventory_stock (variant_id, qty, updated_at)
-      values ${vals.join(",")}
-      on conflict (variant_id)
-      do update set qty = excluded.qty, updated_at = now()
-    `;
-    await pool().query(sql, params);
-    matched += chunk.length;
-  }
+    // 4) upsert
+    let matched = 0;
+    const chunkSize = 500;
 
-  return res.status(200).json({
-    ok: true,
-    shop,
-    bytes_received: bytes,
-    csv_parser: csvStats,
-    parsed_rows: rows.length,
-    unique_keys: agg.size,
-    matched,
-    unmatched_count: unmatched.length,
-    unmatched_sample: unmatched.slice(0, 50),
-    note: unmatched.length ? "Unmatched exist (naming differences)." : "All matched ✅",
-  });
+    for (let i = 0; i < items.length; i += chunkSize) {
+      const chunk = items.slice(i, i + chunkSize);
+
+      const vals = [];
+      const params = [];
+      let p = 1;
+
+      for (const it of chunk) {
+        vals.push(`($${p++}, $${p++}, now())`);
+        params.push(String(it.variant_id), Number(it.qty));
+      }
+
+      const sql = `
+        insert into inventory_stock (variant_id, qty, updated_at)
+        values ${vals.join(",")}
+        on conflict (variant_id)
+        do update set qty = excluded.qty, updated_at = now()
+      `;
+
+      await pool().query(sql, params);
+      matched += chunk.length;
+    }
+
+    return res.status(200).json({
+      ok: true,
+      shop,
+      bytes_received: bytes || Number(req.headers["content-length"] || 0),
+      csv_parser: stats,
+      parsed_rows: parsedRows,
+      emitted_rows: emitted,
+      unique_keys: agg.size,
+      matched,
+      unmatched_count: unmatched.length,
+      unmatched_sample: unmatched.slice(0, 50),
+      note: unmatched.length ? "Unmatched exist (naming differences)." : "All matched ✅",
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
 }
 
 
