@@ -11,7 +11,6 @@ import { Readable } from "stream";
 import { fetchVariantLookup } from "./server/lib/shopifyCatalog.js";
 import { parseStockCsvStream } from "./server/lib/stockCsv.js";
 
-
 async function handleOrdersFulfill(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -58,7 +57,7 @@ function httpsReqJson(url, method = "GET", headers = {}, bodyObj) {
           let parsed = null;
           try {
             parsed = data ? JSON.parse(data) : null;
-          } catch { }
+          } catch {}
           resolve({ ok, status: res.statusCode, json: parsed, data });
         });
       }
@@ -150,7 +149,9 @@ async function cancelFulfillment(shopDomain, fulfillmentId) {
   const token = process.env.SHOPIFY_ADMIN_TOKEN;
   if (!token) throw new Error("Missing SHOPIFY_ADMIN_TOKEN");
 
-  const url = `${shopifyBase(shopDomain)}/fulfillments/${fulfillmentId}/cancel.json`;
+  const url = `${shopifyBase(
+    shopDomain
+  )}/fulfillments/${fulfillmentId}/cancel.json`;
   const r = await httpsReqJson(
     url,
     "POST",
@@ -176,7 +177,8 @@ async function unfulfillOrder(shopDomain, orderId) {
     return st && st !== "cancelled";
   });
 
-  if (!active.length) return { ok: true, message: "No active fulfillments to cancel" };
+  if (!active.length)
+    return { ok: true, message: "No active fulfillments to cancel" };
 
   // newest first
   active.sort((a, b) => {
@@ -260,7 +262,7 @@ async function markOrderAsPaid(shopDomain, orderId) {
   const errs = payload?.userErrors || [];
   if (errs.length) {
     throw new Error(
-      `orderMarkAsPaid failed: ${errs.map(e => e.message).join(" | ")}`
+      `orderMarkAsPaid failed: ${errs.map((e) => e.message).join(" | ")}`
     );
   }
 
@@ -503,15 +505,15 @@ async function handleOrdersTags(req, res) {
   } catch (e) {
     try {
       await client.query("ROLLBACK");
-    } catch { }
+    } catch {}
     try {
       client.release();
-    } catch { }
+    } catch {}
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   } finally {
     try {
       client.release();
-    } catch { }
+    } catch {}
   }
 
   // ✅ AFTER COMMIT: trigger Shopify actions (do NOT block response if it fails)
@@ -542,9 +544,14 @@ async function handleOrdersTags(req, res) {
             "X-Shopify-Access-Token": token,
           });
 
-          const fStatus = String(o.json?.order?.fulfillment_status || "").toLowerCase();
+          const fStatus = String(
+            o.json?.order?.fulfillment_status || ""
+          ).toLowerCase();
           if (fStatus === "fulfilled") {
-            console.log("Already fulfilled, skip fulfill", { orderId, fStatus });
+            console.log("Already fulfilled, skip fulfill", {
+              orderId,
+              fStatus,
+            });
           } else {
             const r1 = await fulfillOrderAllItems(shop, orderId);
             console.log("FULFILL RESULT", r1);
@@ -578,7 +585,6 @@ async function handleOrdersTags(req, res) {
       console.log("SHOPIFY ACTION ERROR", e?.message || String(e));
     }
   })();
-
 
   // ✅ Response immediately (DB updated already)
   return res.status(200).json({
@@ -799,7 +805,6 @@ async function handleWebhookShopify(req, res) {
     "fulfillments/cancelled",
   ]);
 
-
   if (!allowedTopics.has(topic)) {
     return res.status(200).json({ ok: true, ignored: true, topic });
   }
@@ -858,26 +863,43 @@ async function handleWebhookShopify(req, res) {
   ) {
     const orderId = String(payload?.order_id || "").trim();
     if (!shopDomain || !orderId) {
-      return res.status(200).json({ ok: true, skipped: true, reason: "missing shop/order_id", topic });
+      return res
+        .status(200)
+        .json({
+          ok: true,
+          skipped: true,
+          reason: "missing shop/order_id",
+          topic,
+        });
     }
 
     const st = String(payload?.status || "").toLowerCase();
-    const shouldBeShipped = st ? st !== "cancelled" : topic !== "fulfillments/cancelled";
+    const shouldBeShipped = st
+      ? st !== "cancelled"
+      : topic !== "fulfillments/cancelled";
 
     const client = await pool().connect();
     try {
       await client.query("BEGIN");
-      const out = await applyShippedFromShopify(client, shopDomain.toLowerCase(), orderId, shouldBeShipped);
+      const out = await applyShippedFromShopify(
+        client,
+        shopDomain.toLowerCase(),
+        orderId,
+        shouldBeShipped
+      );
       await client.query("COMMIT");
       return res.status(200).json({ ok: true, topic, orderId, ...out });
     } catch (e) {
-      try { await client.query("ROLLBACK"); } catch { }
-      return res.status(500).json({ ok: false, error: e?.message || String(e) });
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+      return res
+        .status(500)
+        .json({ ok: false, error: e?.message || String(e) });
     } finally {
       client.release();
     }
   }
-
 
   // ========================
   //  B) Orders/create webhook
@@ -940,7 +962,7 @@ async function handleWebhookShopify(req, res) {
       errMsg = e?.message || String(e);
       try {
         await client.query("ROLLBACK");
-      } catch { }
+      } catch {}
     } finally {
       client.release();
     }
@@ -962,7 +984,7 @@ async function handleWebhookShopify(req, res) {
         result: errMsg ? "error" : "upsert",
         error: errMsg || null,
       });
-    } catch { }
+    } catch {}
 
     if (errMsg) {
       return res.status(500).json({ ok: false, error: errMsg });
@@ -992,12 +1014,13 @@ async function applyShippedFromShopify(client, shop, orderId, shouldBeShipped) {
   if (!rows?.length) return { ok: false, reason: "order_not_found" };
 
   const current = normalizeTagsForStore(parseTags(rows[0].tags));
-  const hasShipped = current.some(t => t.toLowerCase() === "shipped");
+  const hasShipped = current.some((t) => t.toLowerCase() === "shipped");
 
   let next = current.slice();
 
   if (shouldBeShipped && !hasShipped) next.push("Shipped");
-  if (!shouldBeShipped && hasShipped) next = next.filter(t => t.toLowerCase() !== "shipped");
+  if (!shouldBeShipped && hasShipped)
+    next = next.filter((t) => t.toLowerCase() !== "shipped");
 
   next = normalizeTagsForStore(next);
   const tagsStr = serializeTags(next);
@@ -1018,14 +1041,21 @@ async function handleInventoryImport(req, res) {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
   }
 
-  const shop = String(req.query?.shop || "").toLowerCase().trim();
+  const shop = String(req.query?.shop || "")
+    .toLowerCase()
+    .trim();
   if (!shop) {
     return res.status(400).json({ ok: false, error: "Missing shop in query" });
   }
 
   // Optional: only allow CSV-ish
   const ct = String(req.headers["content-type"] || "").toLowerCase();
-  if (ct && !ct.includes("text/csv") && !ct.includes("application/csv") && !ct.includes("octet-stream")) {
+  if (
+    ct &&
+    !ct.includes("text/csv") &&
+    !ct.includes("application/csv") &&
+    !ct.includes("octet-stream")
+  ) {
     // not blocking hard, but you can if you want:
     // return res.status(415).json({ ok:false, error:"Content-Type must be text/csv" });
   }
@@ -1038,7 +1068,9 @@ async function handleInventoryImport(req, res) {
   req.on("data", (chunk) => {
     bytes += chunk.length;
     if (bytes > MAX_BYTES) {
-      try { req.destroy(); } catch {}
+      try {
+        req.destroy();
+      } catch {}
     }
   });
 
@@ -1050,7 +1082,7 @@ async function handleInventoryImport(req, res) {
     const agg = new Map();
     let parsedRows = 0;
 
-    await parseStockCsvStream(req, (row) => {
+    const stats = await parseStockCsvStream(req, (row) => {
       parsedRows++;
       const key = makeKey(row.title, row.color, row.size);
       agg.set(key, (agg.get(key) || 0) + Number(row.qty || 0));
@@ -1102,14 +1134,14 @@ async function handleInventoryImport(req, res) {
       shop,
       bytes_received: bytes,
       parsed_rows: parsedRows,
+      csv_parser: stats,
       unique_keys: agg.size,
       matched,
       unmatched_count: unmatched.length,
       unmatched_sample: unmatched.slice(0, 50),
-      note:
-        unmatched.length
-          ? "Unmatched exist (usually naming differences). We'll add aliases UI later."
-          : "All matched ✅",
+      note: unmatched.length
+        ? "Unmatched exist (usually naming differences). We'll add aliases UI later."
+        : "All matched ✅",
     });
   } catch (e) {
     const msg = e?.message || String(e);
@@ -1118,7 +1150,11 @@ async function handleInventoryImport(req, res) {
     if (bytes > MAX_BYTES) {
       return res.status(413).json({
         ok: false,
-        error: `CSV too large. Max allowed is ${(MAX_BYTES / 1024 / 1024).toFixed(0)}MB`,
+        error: `CSV too large. Max allowed is ${(
+          MAX_BYTES /
+          1024 /
+          1024
+        ).toFixed(0)}MB`,
         bytes_received: bytes,
       });
     }
@@ -1126,7 +1162,6 @@ async function handleInventoryImport(req, res) {
     return res.status(500).json({ ok: false, error: msg });
   }
 }
-
 
 const server = http.createServer(async (req, res) => {
   const r = enhanceRes(res);
