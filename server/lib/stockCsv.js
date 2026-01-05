@@ -1,4 +1,3 @@
-// server/lib/stockCsv.js
 import { parse } from "csv-parse";
 
 const BLOCK_STARTS = [0, 6, 12, 18, 24, 30, 36];
@@ -26,38 +25,34 @@ export function parseStockCsvStream(readable, onRow) {
       delimiter: [",", ";", "\t"],
     });
 
-    parser.on("readable", () => {
-      let record;
-      while ((record = parser.read()) !== null) {
-        parsed++;
+    parser.on("data", (record) => {
+      parsed++;
 
-        let anyFound = false;
+      let anyFound = false;
 
-        for (const s of BLOCK_STARTS) {
-          const title = safeStr(record[s + 1]);
-          const color = safeStr(record[s + 2]);
-          const size  = safeStr(record[s + 3]);
-          const qty   = safeNum(record[s + 4]);
+      for (const s of BLOCK_STARTS) {
+        const title = safeStr(record[s + 1]);
+        const color = safeStr(record[s + 2]);
+        const size = safeStr(record[s + 3]);
+        const qty = safeNum(record[s + 4]);
 
-          if (!title || qty === null) continue;
+        if (!title || qty === null) continue;
 
-          const t = title.toLowerCase();
-          if (t === "product" || t === "title") continue;
+        const t = title.toLowerCase();
+        if (t === "product" || t === "title") continue;
 
-          anyFound = true;
-          emitted++;
-          onRow({ title, color, size, qty });
-        }
+        anyFound = true;
+        emitted++;
+        onRow({ title, color, size, qty });
+      }
 
-        if (!anyFound) emptyStreak++;
-        else emptyStreak = 0;
+      if (!anyFound) emptyStreak++;
+      else emptyStreak = 0;
 
-        if (emptyStreak > 5000) {
-          resolve({ stoppedEarly: true, parsed, emitted });
-          readable.unpipe(parser);
-          parser.end();
-          return;
-        }
+      if (emptyStreak > 5000) {
+        readable.unpipe(parser);
+        parser.end();
+        resolve({ stoppedEarly: true, parsed, emitted });
       }
     });
 
