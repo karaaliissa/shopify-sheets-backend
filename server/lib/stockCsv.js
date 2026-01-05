@@ -7,7 +7,7 @@ function safeStr(x) {
   return String(x).trim();
 }
 function safeNum(x) {
-  const n = Number(String(x || "").trim());
+  const n = Number(String(x ?? "").trim());
   return Number.isFinite(n) ? n : null;
 }
 
@@ -24,43 +24,48 @@ export function parseStockCsvStream(readable, onRow) {
       bom: true,
       delimiter: [",", ";", "\t"],
     });
-// ✅ supports normalized CSV: title,color,size,qty
-const c0 = safeStr(record[0]).toLowerCase();
-if (c0 === "title" || c0 === "product") return; // header
-
-if (record.length >= 4) {
-  const title = safeStr(record[0]);
-  const color = safeStr(record[1]);
-  const size  = safeStr(record[2]);
-  const qty   = safeNum(record[3]);
-
-  if (title && qty !== null) {
-    anyFound = true;
-    emitted++;
-    onRow({ title, color, size, qty });
-    return; // done for this row
-  }
-}
 
     parser.on("data", (record) => {
       parsed++;
 
       let anyFound = false;
 
-      for (const s of BLOCK_STARTS) {
-        const title = safeStr(record[s + 1]);
-        const color = safeStr(record[s + 2]);
-        const size = safeStr(record[s + 3]);
-        const qty = safeNum(record[s + 4]);
+      // ✅ Case A: normalized CSV: title,color,size,qty
+      const h0 = safeStr(record[0]).toLowerCase();
+      if (h0 === "title" || h0 === "product") return; // header line
 
-        if (!title || qty === null) continue;
+      if (record.length >= 4) {
+        const title = safeStr(record[0]);
+        const color = safeStr(record[1]);
+        const size  = safeStr(record[2]);
+        const qty   = safeNum(record[3]);
 
-        const t = title.toLowerCase();
-        if (t === "product" || t === "title") continue;
+        if (title && qty !== null) {
+          anyFound = true;
+          emitted++;
+          onRow({ title, color, size, qty });
+          // important: do NOT return if it might be legacy row,
+          // but normalized rows will always match here anyway
+        }
+      }
 
-        anyFound = true;
-        emitted++;
-        onRow({ title, color, size, qty });
+      // ✅ Case B: legacy “blocks” CSV (7 blocks)
+      if (!anyFound) {
+        for (const s of BLOCK_STARTS) {
+          const title = safeStr(record[s + 1]);
+          const color = safeStr(record[s + 2]);
+          const size  = safeStr(record[s + 3]);
+          const qty   = safeNum(record[s + 4]);
+
+          if (!title || qty === null) continue;
+
+          const t = title.toLowerCase();
+          if (t === "product" || t === "title") continue;
+
+          anyFound = true;
+          emitted++;
+          onRow({ title, color, size, qty });
+        }
       }
 
       if (!anyFound) emptyStreak++;
