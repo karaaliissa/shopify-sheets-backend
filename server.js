@@ -10,6 +10,7 @@ import { verifyShopifyHmac, normalizeOrderPayload } from "./shopify.js";
 import { Readable } from "stream";
 import { fetchVariantLookup } from "./server/lib/shopifyCatalog.js";
 import { parseStockCsvStream } from "./server/lib/stockCsv.js";
+import { Transform } from "stream";
 
 async function handleOrdersFulfill(req, res) {
   if (req.method !== "POST") {
@@ -1046,7 +1047,13 @@ async function handleInventoryImport(req, res) {
 
   // ✅ count bytes without buffering whole file
   let bytes = 0;
-  req.on("data", (chunk) => (bytes += chunk.length));
+  const counter = new Transform({
+    transform(chunk, enc, cb) {
+      bytes += chunk.length;
+      cb(null, chunk); // IMPORTANT: pass-through
+    },
+  });
+  req.pipe(counter);
 
   // 1) Shopify variant lookup (your swap/material heuristics live here)
   const { lookup, makeKey } = await fetchVariantLookup(shop);
@@ -1058,7 +1065,7 @@ async function handleInventoryImport(req, res) {
   let emitted = 0;
 
   try {
-    const stats = await parseStockCsvStream(req, (row) => {
+    const stats = await parseStockCsvStream(counter, (row) => {
       emitted++;
       const key = makeKey(row.title, row.color, row.size);
       agg.set(key, (agg.get(key) || 0) + Number(row.qty || 0));

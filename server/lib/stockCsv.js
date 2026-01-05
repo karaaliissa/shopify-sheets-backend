@@ -24,6 +24,23 @@ export function parseStockCsvStream(readable, onRow) {
       bom: true,
       delimiter: [",", ";", "\t"],
     });
+// ✅ supports normalized CSV: title,color,size,qty
+const c0 = safeStr(record[0]).toLowerCase();
+if (c0 === "title" || c0 === "product") return; // header
+
+if (record.length >= 4) {
+  const title = safeStr(record[0]);
+  const color = safeStr(record[1]);
+  const size  = safeStr(record[2]);
+  const qty   = safeNum(record[3]);
+
+  if (title && qty !== null) {
+    anyFound = true;
+    emitted++;
+    onRow({ title, color, size, qty });
+    return; // done for this row
+  }
+}
 
     parser.on("data", (record) => {
       parsed++;
