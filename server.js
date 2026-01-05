@@ -5,9 +5,13 @@ import https from "https";
 import http from "http";
 import crypto from "crypto";
 import getRawBody from "raw-body";
-
 import { pool, upsertOrderTx, replaceLineItemsTx, logWebhook } from "./db.js";
 import { verifyShopifyHmac, normalizeOrderPayload } from "./shopify.js";
+import { Readable } from "stream";
+import { fetchVariantLookup } from "./server/lib/shopifyCatalog.js";
+import { parseStockCsvStream } from "./server/lib/stockCsv.js";
+
+
 async function handleOrdersFulfill(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -1007,6 +1011,94 @@ async function applyShippedFromShopify(client, shop, orderId, shouldBeShipped) {
 
   return { ok: true, tags: next, tags_str: tagsStr };
 }
+async function handleInventoryImport(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  }
+
+  const shop = String(req.query?.shop || "").toLowerCase().trim();
+  if (!shop) {
+    return res.status(400).json({ ok: false, error: "Missing shop in query" });
+  }
+
+  // read raw CSV body
+  const csvText = await getRawBody(req, { limit: "15mb", encoding: "utf8" });
+  if (!csvText || csvText.trim().length < 10) {
+    return res.status(400).json({ ok: false, error: "Empty CSV body" });
+  }
+
+  // 1) Shopify variant lookup (handles Color/Size swaps + Material/Fabric)
+  const { lookup, makeKey } = await fetchVariantLookup(shop);
+
+  // 2) parse CSV (wide layout)
+  const rows = [];
+  const stream = Readable.from([csvText]);
+
+  await parseStockCsvStream(stream, (row) => rows.push(row));
+
+  // 3) aggregate qty per key
+  const agg = new Map();
+  for (const r of rows) {
+    const key = makeKey(r.title, r.color, r.size);
+    agg.set(key, (agg.get(key) || 0) + Number(r.qty || 0));
+  }
+
+  // 4) match
+  const items = [];
+  const unmatched = [];
+
+  for (const [key, qty] of agg.entries()) {
+    const v = lookup.get(key);
+    if (!v) {
+      const [t, c, s] = key.split("|");
+      unmatched.push({ product_title: t, color: c, size: s, qty });
+      continue;
+    }
+    items.push({ variant_id: String(v.variant_id), qty: Number(qty || 0) });
+  }
+
+  // 5) upsert
+  let matched = 0;
+  const chunkSize = 500;
+
+  for (let i = 0; i < items.length; i += chunkSize) {
+    const chunk = items.slice(i, i + chunkSize);
+
+    const vals = [];
+    const params = [];
+    let p = 1;
+
+    for (const it of chunk) {
+      vals.push(`($${p++}, $${p++}, now())`);
+      params.push(String(it.variant_id), Number(it.qty));
+    }
+
+    const sql = `
+      insert into inventory_stock (variant_id, qty, updated_at)
+      values ${vals.join(",")}
+      on conflict (variant_id)
+      do update set qty = excluded.qty, updated_at = now()
+    `;
+
+    await pool().query(sql, params);
+    matched += chunk.length;
+  }
+
+  return res.status(200).json({
+    ok: true,
+    shop,
+    parsed_rows: rows.length,
+    unique_keys: agg.size,
+    matched,
+    unmatched_count: unmatched.length,
+    unmatched_sample: unmatched.slice(0, 50),
+    note:
+      unmatched.length
+        ? "Unmatched exist (usually naming differences). We'll add aliases UI later."
+        : "All matched ✅",
+  });
+}
 
 const server = http.createServer(async (req, res) => {
   const r = enhanceRes(res);
@@ -1024,6 +1116,7 @@ const server = http.createServer(async (req, res) => {
   if (p === "/api/orders/deliver-by") return handleDeliverBy(req, r);
   if (p === "/api/orders/note-local") return handleNoteLocal(req, r);
   if (p === "/api/orders/fulfill") return handleOrdersFulfill(req, r);
+  if (p === "/api/inventory/import") return handleInventoryImport(req, r);
 
   return r.status(404).json({ ok: false, error: "Not Found" });
 });

@@ -6,7 +6,9 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "csv-parse": "^6.1.0",
     "dotenv": "^17.2.3",
+    "multer": "^2.0.2",
     "pg": "^8.16.3",
     "raw-body": "^3.0.0"
   }
