@@ -11,6 +11,7 @@ import { Readable } from "stream";
 import { fetchVariantLookup } from "./server/lib/shopifyCatalog.js";
 import { parseStockCsvStream } from "./server/lib/stockCsv.js";
 import { Transform } from "stream";
+import { applyOrderProcessingToInventory } from "./server/lib/inventoryApply.js";
 
 async function handleOrdersFulfill(req, res) {
   if (req.method !== "POST") {
@@ -58,7 +59,7 @@ function httpsReqJson(url, method = "GET", headers = {}, bodyObj) {
           let parsed = null;
           try {
             parsed = data ? JSON.parse(data) : null;
-          } catch {}
+          } catch { }
           resolve({ ok, status: res.statusCode, json: parsed, data });
         });
       }
@@ -506,15 +507,15 @@ async function handleOrdersTags(req, res) {
   } catch (e) {
     try {
       await client.query("ROLLBACK");
-    } catch {}
+    } catch { }
     try {
       client.release();
-    } catch {}
+    } catch { }
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   } finally {
     try {
       client.release();
-    } catch {}
+    } catch { }
   }
 
   // ✅ AFTER COMMIT: trigger Shopify actions (do NOT block response if it fails)
@@ -535,6 +536,12 @@ async function handleOrdersTags(req, res) {
 
       // ✅ Only below this point: "add" actions
       if (action !== "add") return;
+      // ===== PROCESSING => deduct inventory (LOCAL DB only) =====
+      if (normalized === "processing") {
+        const rInv = await applyOrderProcessingToInventory(shop, orderId);
+        console.log("INVENTORY DEDUCT RESULT", rInv);
+        // ما تعمل return هون إذا بدك تكمل أي actions ثانية
+      }
 
       // ===== SHIPPED => fulfill =====
       if (normalized === "shipped") {
@@ -893,7 +900,7 @@ async function handleWebhookShopify(req, res) {
     } catch (e) {
       try {
         await client.query("ROLLBACK");
-      } catch {}
+      } catch { }
       return res
         .status(500)
         .json({ ok: false, error: e?.message || String(e) });
@@ -963,7 +970,7 @@ async function handleWebhookShopify(req, res) {
       errMsg = e?.message || String(e);
       try {
         await client.query("ROLLBACK");
-      } catch {}
+      } catch { }
     } finally {
       client.release();
     }
@@ -985,7 +992,7 @@ async function handleWebhookShopify(req, res) {
         result: errMsg ? "error" : "upsert",
         error: errMsg || null,
       });
-    } catch {}
+    } catch { }
 
     if (errMsg) {
       return res.status(500).json({ ok: false, error: errMsg });
@@ -1175,6 +1182,97 @@ async function handleInventoryImport(req, res) {
   }
 }
 
+async function handleInventorySearch(req, res) {
+  const shop = String(req.query?.shop || "").trim().toLowerCase();
+  const qText = String(req.query?.q || "").trim();
+  const limit = Math.min(Number(req.query?.limit || 25), 50);
+
+  if (!shop) return res.status(400).json({ ok: false, error: "missing_shop" });
+  if (qText.length < 2) return res.status(200).json({ ok: true, items: [] });
+
+  // Shopify variants search: title or sku
+  const gql = `
+    query ($q: String!, $n: Int!) {
+      productVariants(first: $n, query: $q) {
+        edges {
+          node {
+            id
+            sku
+            title
+            inventoryQuantity
+            product { title }
+          }
+        }
+      }
+    }
+  `;
+
+  // Shopify query string (جرّب هيك)
+  const shopifyQuery = `sku:*${qText}* OR title:*${qText}* OR product_title:*${qText}*`;
+
+  const data = await shopifyGraphql(shop, gql, { q: shopifyQuery, n: limit });
+  const nodes = (data?.productVariants?.edges || []).map(e => e?.node).filter(Boolean);
+
+  const variantIds = nodes.map(v => String(v.id || "").split("/").pop()).filter(Boolean);
+
+  // local stock
+  const { rows: stockRows } = await pool().query(
+    `select variant_id, qty from inventory_stock where variant_id = any($1)`,
+    [variantIds]
+  );
+  const stockMap = new Map(stockRows.map(r => [String(r.variant_id), Number(r.qty || 0)]));
+
+  // reserved (orders اللي بعدها مش Processing)
+  // reserved = موجودة في line items بس order tags ما فيها processing/shipped/complete
+  const { rows: reservedRows } = await pool().query(
+    `
+    select
+      li.variant_id,
+      sum(li.quantity)::int as reserved_qty,
+      count(distinct li.order_id)::int as open_orders_count
+    from tbl_order_line_item li
+    join tbl_order o
+      on o.shop_domain = li.shop_domain and o.order_id = li.order_id
+    where li.shop_domain = $1
+      and li.variant_id = any($2)
+      and (',' || lower(coalesce(o.tags,'')) || ',') not like '%,processing,%'
+      and (',' || lower(coalesce(o.tags,'')) || ',') not like '%,shipped,%'
+      and (',' || lower(coalesce(o.tags,'')) || ',') not like '%,complete,%'
+    group by li.variant_id
+    `,
+    [shop, variantIds]
+  );
+  const reservedMap = new Map(
+    reservedRows.map(r => [
+      String(r.variant_id),
+      { reserved_qty: Number(r.reserved_qty || 0), open_orders_count: Number(r.open_orders_count || 0) }
+    ])
+  );
+
+  const items = nodes.map(v => {
+    const variant_id = String(v.id || "").split("/").pop();
+    const reserved = reservedMap.get(variant_id) || { reserved_qty: 0, open_orders_count: 0 };
+    const stock_qty = stockMap.get(variant_id) ?? 0;
+
+    return {
+      variant_id,
+      gid: v.id,
+      sku: v.sku || "",
+      product_title: v.product?.title || "",
+      variant_title: v.title || "",
+      shopify_inventory_qty: Number(v.inventoryQuantity ?? 0),
+
+      stock_qty,
+      reserved_qty: reserved.reserved_qty,
+      in_open_order: reserved.reserved_qty > 0,
+      open_orders_count: reserved.open_orders_count,
+
+      available_qty: Math.max(stock_qty - reserved.reserved_qty, 0),
+    };
+  });
+
+  return res.status(200).json({ ok: true, items });
+}
 
 
 
@@ -1195,6 +1293,7 @@ const server = http.createServer(async (req, res) => {
   if (p === "/api/orders/note-local") return handleNoteLocal(req, r);
   if (p === "/api/orders/fulfill") return handleOrdersFulfill(req, r);
   if (p === "/api/inventory/import") return handleInventoryImport(req, r);
+  if (p === "/api/inventory/search") return handleInventorySearch(req, r);
 
   return r.status(404).json({ ok: false, error: "Not Found" });
 });
