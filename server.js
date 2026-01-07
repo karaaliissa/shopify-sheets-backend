@@ -420,7 +420,14 @@ async function handleOrdersSummary(req, res) {
 
   return res.status(200).json({ ok: true, shop, ...(rows?.[0] || {}) });
 }
-
+async function readJson(req) {
+  const raw = await getRawBody(req, { limit: "200kb", encoding: "utf8" });
+  try {
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
 async function handleOrdersTags(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -1182,97 +1189,37 @@ async function handleInventoryImport(req, res) {
   }
 }
 
-async function handleInventorySearch(req, res) {
-  const shop = String(req.query?.shop || "").trim().toLowerCase();
-  const qText = String(req.query?.q || "").trim();
-  const limit = Math.min(Number(req.query?.limit || 25), 50);
+async function handleInventorySet(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  }
 
-  if (!shop) return res.status(400).json({ ok: false, error: "missing_shop" });
-  if (qText.length < 2) return res.status(200).json({ ok: true, items: [] });
+  const shop = String(req.query?.shop || "").toLowerCase().trim(); // optional
+  const body = await readJson(req);
 
-  // Shopify variants search: title or sku
-  const gql = `
-    query ($q: String!, $n: Int!) {
-      productVariants(first: $n, query: $q) {
-        edges {
-          node {
-            id
-            sku
-            title
-            inventoryQuantity
-            product { title }
-          }
-        }
-      }
-    }
-  `;
+  const variant_id = String(body?.variant_id || "").trim();
+  const qtyNum = Number(body?.qty);
 
-  // Shopify query string (جرّب هيك)
-  const shopifyQuery = `sku:*${qText}* OR title:*${qText}* OR product_title:*${qText}*`;
+  if (!variant_id) return res.status(400).json({ ok: false, error: "missing_variant_id" });
+  if (!Number.isFinite(qtyNum) || qtyNum < 0)
+    return res.status(400).json({ ok: false, error: "invalid_qty" });
 
-  const data = await shopifyGraphql(shop, gql, { q: shopifyQuery, n: limit });
-  const nodes = (data?.productVariants?.edges || []).map(e => e?.node).filter(Boolean);
+  const qty = Math.floor(qtyNum);
 
-  const variantIds = nodes.map(v => String(v.id || "").split("/").pop()).filter(Boolean);
-
-  // local stock
-  const { rows: stockRows } = await pool().query(
-    `select variant_id, qty from inventory_stock where variant_id = any($1)`,
-    [variantIds]
-  );
-  const stockMap = new Map(stockRows.map(r => [String(r.variant_id), Number(r.qty || 0)]));
-
-  // reserved (orders اللي بعدها مش Processing)
-  // reserved = موجودة في line items بس order tags ما فيها processing/shipped/complete
-  const { rows: reservedRows } = await pool().query(
+  await pool().query(
     `
-    select
-      li.variant_id,
-      sum(li.quantity)::int as reserved_qty,
-      count(distinct li.order_id)::int as open_orders_count
-    from tbl_order_line_item li
-    join tbl_order o
-      on o.shop_domain = li.shop_domain and o.order_id = li.order_id
-    where li.shop_domain = $1
-      and li.variant_id = any($2)
-      and (',' || lower(coalesce(o.tags,'')) || ',') not like '%,processing,%'
-      and (',' || lower(coalesce(o.tags,'')) || ',') not like '%,shipped,%'
-      and (',' || lower(coalesce(o.tags,'')) || ',') not like '%,complete,%'
-    group by li.variant_id
+    insert into inventory_stock(variant_id, qty, updated_at)
+    values ($1, $2, now())
+    on conflict (variant_id)
+    do update set qty = excluded.qty, updated_at = now()
     `,
-    [shop, variantIds]
-  );
-  const reservedMap = new Map(
-    reservedRows.map(r => [
-      String(r.variant_id),
-      { reserved_qty: Number(r.reserved_qty || 0), open_orders_count: Number(r.open_orders_count || 0) }
-    ])
+    [variant_id, qty]
   );
 
-  const items = nodes.map(v => {
-    const variant_id = String(v.id || "").split("/").pop();
-    const reserved = reservedMap.get(variant_id) || { reserved_qty: 0, open_orders_count: 0 };
-    const stock_qty = stockMap.get(variant_id) ?? 0;
-
-    return {
-      variant_id,
-      gid: v.id,
-      sku: v.sku || "",
-      product_title: v.product?.title || "",
-      variant_title: v.title || "",
-      shopify_inventory_qty: Number(v.inventoryQuantity ?? 0),
-
-      stock_qty,
-      reserved_qty: reserved.reserved_qty,
-      in_open_order: reserved.reserved_qty > 0,
-      open_orders_count: reserved.open_orders_count,
-
-      available_qty: Math.max(stock_qty - reserved.reserved_qty, 0),
-    };
-  });
-
-  return res.status(200).json({ ok: true, items });
+  return res.status(200).json({ ok: true, shop, variant_id, qty });
 }
+
 
 
 
@@ -1294,6 +1241,7 @@ const server = http.createServer(async (req, res) => {
   if (p === "/api/orders/fulfill") return handleOrdersFulfill(req, r);
   if (p === "/api/inventory/import") return handleInventoryImport(req, r);
   if (p === "/api/inventory/search") return handleInventorySearch(req, r);
+  if (p === "/api/inventory/set") return handleInventorySet(req, r);
 
   return r.status(404).json({ ok: false, error: "Not Found" });
 });
