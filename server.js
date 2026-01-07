@@ -1220,10 +1220,6 @@ async function handleInventorySet(req, res) {
   return res.status(200).json({ ok: true, shop, variant_id, qty });
 }
 
-
-const _catalogCache = new Map(); // shop -> { at, byVariantId }
-const CATALOG_TTL_MS = 10 * 60 * 1000;
-
 function tokenize(q) {
   return String(q || "")
     .toLowerCase()
@@ -1233,31 +1229,34 @@ function tokenize(q) {
     .filter(Boolean);
 }
 
+const _catalogCache = new Map(); // shop -> { at, byVariantId }
+const CATALOG_TTL_MS = 10 * 60 * 1000;
+
 async function getCatalogByVariantId(shop) {
   const now = Date.now();
   const cached = _catalogCache.get(shop);
   if (cached && now - cached.at < CATALOG_TTL_MS) return cached.byVariantId;
 
-  const { lookup } = await fetchVariantLookup(shop);
+  // ✅ use byVariantId directly (contains sku/image/title/etc)
+  const { byVariantId } = await fetchVariantLookup(shop);
 
-  const byVariantId = new Map();
-  for (const [, v] of lookup.entries()) {
-    const vid = String(v?.variant_id || "").trim();
-    if (!vid) continue;
-    if (!byVariantId.has(vid)) {
-      byVariantId.set(vid, {
-        title: v?.product_title || "",
-        color: v?.color || "",
-        size: v?.size || "",
-        sku: v?.sku || "",     // if you add sku later
-        image: v?.image || null,
-      });
-    }
+  // store only what we need (lighter cache)
+  const slim = new Map();
+  for (const [vid, v] of byVariantId.entries()) {
+    slim.set(String(vid), {
+      title: String(v?.title || v?.product_title || ""),
+      product_title: String(v?.product_title || v?.title || ""),
+      color: String(v?.color || ""),
+      size: String(v?.size || ""),
+      sku: String(v?.sku || ""),
+      image: v?.image || null,
+    });
   }
 
-  _catalogCache.set(shop, { at: now, byVariantId });
-  return byVariantId;
+  _catalogCache.set(shop, { at: now, byVariantId: slim });
+  return slim;
 }
+
 
 async function handleInventorySearch(req, res) {
   try {
@@ -1275,7 +1274,7 @@ async function handleInventorySearch(req, res) {
 
     const matchedVariantIds = [];
     for (const [variant_id, meta] of byVariantId.entries()) {
-      const blob = `${meta.title} ${meta.color} ${meta.size}`.toLowerCase();
+      const blob = `${meta.title} ${meta.product_title} ${meta.color} ${meta.size} ${meta.sku}`.toLowerCase();
       const ok = tokens.every((t) => blob.includes(t));
       if (!ok) continue;
       matchedVariantIds.push(variant_id);
@@ -1309,13 +1308,19 @@ async function handleInventorySearch(req, res) {
 
       return {
         variant_id: vid,
-        stock_qty: Number(st?.qty ?? 0),        // ✅ match your UI
+        stock_qty: Number(st?.qty ?? 0),
+        reserved_qty: 0, // optional (if you don't have it yet)
         updated_at: st?.updated_at || null,
+
+        // ✅ metadata
         title: meta?.title || "",
+        product_title: meta?.product_title || meta?.title || "",
+        sku: meta?.sku || "",
         color: meta?.color || "",
         size: meta?.size || "",
         image: meta?.image || null,
       };
+
     });
 
     // sort by qty desc

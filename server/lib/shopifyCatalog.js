@@ -16,8 +16,8 @@ function makeKey(title, color, size) {
 
 // --- Heuristics: detect sizes even if employee put them under Color/Size wrong ---
 const SIZE_SET = new Set([
-  "xxxs","xxs","xs","s","m","l","xl","xxl","xxxl",
-  "0","1","2","3","4","5","6","7","8","9","10",
+  "xxxs", "xxs", "xs", "s", "m", "l", "xl", "xxl", "xxxl",
+  "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
 ]);
 
 function looksLikeSize(v) {
@@ -51,11 +51,11 @@ function inferColorSize(selectedOptions) {
 
   // 1) try by name (with aliases)
   let color = pickOptionValue(opts, ["color", "colour", "colors", "colours"]);
-  let size  = pickOptionValue(opts, ["size", "sizes"]);
+  let size = pickOptionValue(opts, ["size", "sizes"]);
 
   // 2) if swapped or wrong: check values
   const colorLooksSize = looksLikeSize(color);
-  const sizeLooksSize  = looksLikeSize(size);
+  const sizeLooksSize = looksLikeSize(size);
 
   // if "size" value is NOT size, but "color" value IS size => swap
   if (color && size && colorLooksSize && !sizeLooksSize) {
@@ -84,10 +84,13 @@ function inferColorSize(selectedOptions) {
   return { color: String(color || "").trim(), size: String(size || "").trim() };
 }
 
+// server/lib/shopifyCatalog.js
 export async function fetchVariantLookup(shopDomain) {
   if (!shopDomain) throw new Error("Missing shopDomain");
 
-  const lookup = new Map();
+  const lookup = new Map();       // key(title+color+size) => item
+  const byVariantId = new Map();  // variant_id => item ✅
+
   let cursor = null;
 
   const query = `
@@ -97,8 +100,13 @@ export async function fetchVariantLookup(shopDomain) {
           cursor
           node {
             id
+            sku
             image { url }
-            product { title }
+            product {
+              title
+              featuredImage { url }
+              images(first: 1) { nodes { url } }
+            }
             selectedOptions { name value }
           }
         }
@@ -111,32 +119,53 @@ export async function fetchVariantLookup(shopDomain) {
     const data = await shopifyGraphql(shopDomain, query, { cursor });
 
     const edges = data?.productVariants?.edges || [];
-    const hasNext = data?.productVariants?.pageInfo?.hasNextPage;
+    const hasNext = !!data?.productVariants?.pageInfo?.hasNextPage;
 
     for (const e of edges) {
-      const node = e.node;
+      const node = e?.node || {};
       const variant_id = String(node?.id || "").split("/").pop();
-      const product_title = node?.product?.title || "";
-
-      const { color, size } = inferColorSize(node?.selectedOptions || []);
-
-      // only index if we have at least title + (color or size). Prefer both.
-      const key = makeKey(product_title, color, size);
-      if (!lookup.has(key)) {
-        lookup.set(key, {
-          variant_id,
-          product_title,
-          color,
-          size,
-          image: node?.image?.url || null,
-        });
+      if (!variant_id) {
+        cursor = e?.cursor || cursor;
+        continue;
       }
 
-      cursor = e.cursor;
+      const product_title = String(node?.product?.title || "").trim();
+
+      const { color, size } = inferColorSize(node?.selectedOptions || []);
+      const sku = String(node?.sku || "").trim();
+
+      const productImg =
+        node?.product?.featuredImage?.url ||
+        node?.product?.images?.nodes?.[0]?.url ||
+        null;
+
+      const image = node?.image?.url || productImg || null;
+
+      const item = {
+        variant_id,
+        product_title,
+        title: product_title, // 👈 لو بتحب تستخدم it.title بالفرونت
+        color: color || "",
+        size: size || "",
+        sku,
+        image,
+      };
+
+      // ✅ direct map by variant_id (important for stock UI)
+      if (!byVariantId.has(variant_id)) byVariantId.set(variant_id, item);
+
+      // ✅ key map (only if title exists)
+      const key = makeKey(product_title, item.color, item.size);
+      if (product_title && key && !lookup.has(key)) {
+        lookup.set(key, item);
+      }
+
+      cursor = e?.cursor || cursor;
     }
 
     if (!hasNext) break;
   }
 
-  return { lookup, makeKey, norm };
+  return { lookup, byVariantId, makeKey, norm };
 }
+
