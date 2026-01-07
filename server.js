@@ -1221,6 +1221,75 @@ async function handleInventorySet(req, res) {
 }
 
 
+async function handleInventorySearch(req, res) {
+  try {
+    const shop = String(req.query?.shop || "").toLowerCase().trim();
+    const qText = String(req.query?.q || "").trim();
+    const limit = Math.min(
+      Math.max(parseInt(req.query?.limit || "25", 10) || 25, 1),
+      200
+    );
+
+    if (!shop) return res.status(400).json({ ok: false, error: "Missing shop" });
+    if (!qText) return res.status(200).json({ ok: true, items: [] });
+
+    // 1) SAFE search in DB (won't crash)
+    const { rows } = await pool().query(
+      `
+      select variant_id, qty, updated_at
+      from inventory_stock
+      where variant_id ilike $1
+      order by updated_at desc nulls last
+      limit $2
+      `,
+      [`%${qText}%`, limit]
+    );
+
+    if (!rows.length) return res.status(200).json({ ok: true, items: [] });
+
+    // 2) Load Shopify catalog lookup ONCE
+    const { lookup } = await fetchVariantLookup(shop);
+
+    // 3) Build a quick map: variant_id -> catalog info (title/color/size/image)
+    const byVariantId = new Map();
+    for (const [, v] of lookup.entries()) {
+      const vid = String(v?.variant_id || "").trim();
+      if (!vid) continue;
+      // keep first one
+      if (!byVariantId.has(vid)) {
+        byVariantId.set(vid, {
+          product_title: v?.product_title || "",
+          color: v?.color || "",
+          size: v?.size || "",
+          image: v?.image || null,
+        });
+      }
+    }
+
+    // 4) Merge
+    const items = rows.map((r) => {
+      const vid = String(r.variant_id || "").trim();
+      const meta = byVariantId.get(vid);
+      return {
+        variant_id: vid,
+        qty: Number(r.qty ?? 0),
+        updated_at: r.updated_at || null,
+
+        // ✅ extra fields (may be null/empty if not found)
+        title: meta?.product_title || "",
+        color: meta?.color || "",
+        size: meta?.size || "",
+        image: meta?.image || null,
+      };
+    });
+
+    return res.status(200).json({ ok: true, items });
+  } catch (e) {
+    console.log("inventory/search error", e?.message || e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+}
+
 
 
 const server = http.createServer(async (req, res) => {
