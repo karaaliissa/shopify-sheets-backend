@@ -1221,69 +1221,107 @@ async function handleInventorySet(req, res) {
 }
 
 
+const _catalogCache = new Map(); // shop -> { at, byVariantId }
+const CATALOG_TTL_MS = 10 * 60 * 1000;
+
+function tokenize(q) {
+  return String(q || "")
+    .toLowerCase()
+    .trim()
+    .split(/\s+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+async function getCatalogByVariantId(shop) {
+  const now = Date.now();
+  const cached = _catalogCache.get(shop);
+  if (cached && now - cached.at < CATALOG_TTL_MS) return cached.byVariantId;
+
+  const { lookup } = await fetchVariantLookup(shop);
+
+  const byVariantId = new Map();
+  for (const [, v] of lookup.entries()) {
+    const vid = String(v?.variant_id || "").trim();
+    if (!vid) continue;
+    if (!byVariantId.has(vid)) {
+      byVariantId.set(vid, {
+        title: v?.product_title || "",
+        color: v?.color || "",
+        size: v?.size || "",
+        sku: v?.sku || "",     // if you add sku later
+        image: v?.image || null,
+      });
+    }
+  }
+
+  _catalogCache.set(shop, { at: now, byVariantId });
+  return byVariantId;
+}
+
 async function handleInventorySearch(req, res) {
   try {
     const shop = String(req.query?.shop || "").toLowerCase().trim();
     const qText = String(req.query?.q || "").trim();
-    const limit = Math.min(
-      Math.max(parseInt(req.query?.limit || "25", 10) || 25, 1),
-      200
-    );
+    const limit = Math.min(Math.max(parseInt(req.query?.limit || "25", 10) || 25, 1), 200);
 
     if (!shop) return res.status(400).json({ ok: false, error: "Missing shop" });
     if (!qText) return res.status(200).json({ ok: true, items: [] });
 
-    // 1) SAFE search in DB (won't crash)
+    const tokens = tokenize(qText);
+
+    // 1) catalog match first (safe)
+    const byVariantId = await getCatalogByVariantId(shop);
+
+    const matchedVariantIds = [];
+    for (const [variant_id, meta] of byVariantId.entries()) {
+      const blob = `${meta.title} ${meta.color} ${meta.size}`.toLowerCase();
+      const ok = tokens.every((t) => blob.includes(t));
+      if (!ok) continue;
+      matchedVariantIds.push(variant_id);
+      if (matchedVariantIds.length >= limit) break;
+    }
+
+    if (!matchedVariantIds.length) return res.status(200).json({ ok: true, items: [] });
+
+    // 2) fetch stock for those variants (DB)
+    const params = [];
+    const placeholders = matchedVariantIds.map((id, idx) => {
+      params.push(id);
+      return `$${idx + 1}`;
+    });
+
     const { rows } = await pool().query(
       `
       select variant_id, qty, updated_at
       from inventory_stock
-      where variant_id ilike $1
-      order by updated_at desc nulls last
-      limit $2
+      where variant_id in (${placeholders.join(",")})
       `,
-      [`%${qText}%`, limit]
+      params
     );
 
-    if (!rows.length) return res.status(200).json({ ok: true, items: [] });
+    const stockMap = new Map(rows.map((r) => [String(r.variant_id), r]));
 
-    // 2) Load Shopify catalog lookup ONCE
-    const { lookup } = await fetchVariantLookup(shop);
-
-    // 3) Build a quick map: variant_id -> catalog info (title/color/size/image)
-    const byVariantId = new Map();
-    for (const [, v] of lookup.entries()) {
-      const vid = String(v?.variant_id || "").trim();
-      if (!vid) continue;
-      // keep first one
-      if (!byVariantId.has(vid)) {
-        byVariantId.set(vid, {
-          product_title: v?.product_title || "",
-          color: v?.color || "",
-          size: v?.size || "",
-          image: v?.image || null,
-        });
-      }
-    }
-
-    // 4) Merge
-    const items = rows.map((r) => {
-      const vid = String(r.variant_id || "").trim();
+    // 3) merge result
+    const items = matchedVariantIds.map((vid) => {
       const meta = byVariantId.get(vid);
+      const st = stockMap.get(vid);
+
       return {
         variant_id: vid,
-        qty: Number(r.qty ?? 0),
-        updated_at: r.updated_at || null,
-
-        // ✅ extra fields (may be null/empty if not found)
-        title: meta?.product_title || "",
+        stock_qty: Number(st?.qty ?? 0),        // ✅ match your UI
+        updated_at: st?.updated_at || null,
+        title: meta?.title || "",
         color: meta?.color || "",
         size: meta?.size || "",
         image: meta?.image || null,
       };
     });
 
-    return res.status(200).json({ ok: true, items });
+    // sort by qty desc
+    items.sort((a, b) => (Number(b.stock_qty) || 0) - (Number(a.stock_qty) || 0));
+
+    return res.status(200).json({ ok: true, items: items.slice(0, limit) });
   } catch (e) {
     console.log("inventory/search error", e?.message || e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
