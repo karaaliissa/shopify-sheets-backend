@@ -1333,6 +1333,51 @@ async function handleInventorySearch(req, res) {
   }
 }
 
+async function handleInventoryAll(req, res) {
+  try {
+    const shop = String(req.query?.shop || "").toLowerCase().trim();
+    if (!shop) return res.status(400).json({ ok: false, error: "Missing shop" });
+
+    // 1) get all stock rows
+    const { rows } = await pool().query(
+      `
+      select variant_id, qty, updated_at
+      from inventory_stock
+      order by updated_at desc nulls last
+      `
+    );
+
+    // 2) catalog meta (cached)
+    const byVariantId = await getCatalogByVariantId(shop);
+
+    // 3) merge
+    const items = rows.map((r) => {
+      const vid = String(r.variant_id || "");
+      const meta = byVariantId.get(vid);
+
+      return {
+        variant_id: vid,                 // (we keep it but UI won’t show it)
+        stock_qty: Number(r.qty ?? 0),
+        updated_at: r.updated_at || null,
+
+        title: meta?.title || meta?.product_title || "",
+        product_title: meta?.product_title || meta?.title || "",
+        color: meta?.color || "",
+        size: meta?.size || "",
+        sku: meta?.sku || "",
+        image: meta?.image || null,
+      };
+    });
+
+    // optional: sort by title
+    items.sort((a, b) => String(a.title).localeCompare(String(b.title)));
+
+    return res.status(200).json({ ok: true, items });
+  } catch (e) {
+    console.log("inventory/all error", e?.message || e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+}
 
 
 const server = http.createServer(async (req, res) => {
@@ -1354,6 +1399,7 @@ const server = http.createServer(async (req, res) => {
   if (p === "/api/inventory/import") return handleInventoryImport(req, r);
   if (p === "/api/inventory/search") return handleInventorySearch(req, r);
   if (p === "/api/inventory/set") return handleInventorySet(req, r);
+  if (p === "/api/inventory/all") return handleInventoryAll(req, r);
 
   return r.status(404).json({ ok: false, error: "Not Found" });
 });
