@@ -1332,7 +1332,93 @@ async function handleInventorySearch(req, res) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 }
+// ---------- category helpers ----------
+function normKey(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/&/g, "and")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
 
+const CATEGORY_SYNONYMS = [
+  { cat: "Blazer", keys: ["blazer", "blazers"] },
+  { cat: "Bodysuit", keys: ["bodysuit", "body suit", "body suits"] },
+  { cat: "Corset", keys: ["corset", "corsets"] },
+
+  // ✅ unify CropTop / Crop Top / croptop
+  { cat: "CropTop", keys: ["croptop", "crop top", "crop tops"] },
+
+  // Dresses + sub-types
+  { cat: "Mini Dress", keys: ["mini dress", "mini dresses"] },
+  { cat: "Midi Dress", keys: ["midi dress", "midi dresses"] },
+  { cat: "Maxi Dress", keys: ["maxi dress", "maxi dresses"] },
+  { cat: "Dresses", keys: ["dress", "dresses"] },
+
+  { cat: "Jumpsuits & Rompers", keys: ["jumpsuit", "jumpsuits", "romper", "rompers"] },
+  { cat: "Matching Sets", keys: ["matching set", "matching sets", "two piece", "2 piece", "set", "sets"] },
+  { cat: "Pants", keys: ["pants", "trousers", "legging", "leggings"] },
+  { cat: "Skirts", keys: ["skirt", "skirts"] },
+  { cat: "Tops", keys: ["top", "tops", "shirt", "shirts", "tee", "tshirt", "t-shirt"] },
+];
+
+function detectCategoryFromText(title, productTitle) {
+  const text = normKey(`${title || ""} ${productTitle || ""}`);
+
+  // priority: specific dress types first
+  for (const p of ["Mini Dress", "Midi Dress", "Maxi Dress"]) {
+    const rule = CATEGORY_SYNONYMS.find((x) => x.cat === p);
+    if (rule && rule.keys.some((k) => text.includes(normKey(k)))) return p;
+  }
+
+  // normal scan
+  for (const rule of CATEGORY_SYNONYMS) {
+    if (["Mini Dress", "Midi Dress", "Maxi Dress"].includes(rule.cat)) continue;
+    if (rule.keys.some((k) => text.includes(normKey(k)))) return rule.cat;
+  }
+
+  return "Uncategorized";
+}
+
+function buildCategories(meta) {
+  // 1) if meta already provides categories, use them (and normalize CropTop)
+  const rawArr = Array.isArray(meta?.categories) ? meta.categories.filter(Boolean) : [];
+  if (rawArr.length) {
+    const cleaned = rawArr.map((x) => {
+      const k = normKey(x);
+      if (k === "crop top" || k === "croptop") return "CropTop";
+      return String(x).trim();
+    });
+    // If it contains Mini/Midi/Maxi without Dresses, prepend Dresses
+    const sub = cleaned.find((x) => ["Mini Dress", "Midi Dress", "Maxi Dress"].includes(x));
+    if (sub && !cleaned.includes("Dresses")) return ["Dresses", sub];
+    return cleaned;
+  }
+
+  // 2) meta.category/product_type if exists (normalize)
+  const rawCat = String(meta?.category || meta?.product_type || "").trim();
+  if (rawCat) {
+    const k = normKey(rawCat);
+    if (k === "crop top" || k === "croptop") return ["CropTop"];
+    // if they store "Mini Dress" as category, group under Dresses
+    if (["mini dress", "midi dress", "maxi dress"].includes(k)) return ["Dresses", titleCase(rawCat)];
+    return [rawCat];
+  }
+
+  return [];
+}
+
+function titleCase(s) {
+  const x = String(s || "").trim();
+  if (!x) return "";
+  return x
+    .split(/\s+/)
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1).toLowerCase() : ""))
+    .join(" ")
+    .trim();
+}
+
+// ✅ FULL handler
 async function handleInventoryAll(req, res) {
   try {
     const shop = String(req.query?.shop || "").toLowerCase().trim();
@@ -1350,27 +1436,55 @@ async function handleInventoryAll(req, res) {
     // 2) catalog meta (cached)
     const byVariantId = await getCatalogByVariantId(shop);
 
-    // 3) merge
+    // 3) merge + category detect
     const items = rows.map((r) => {
       const vid = String(r.variant_id || "");
-      const meta = byVariantId.get(vid);
+      const meta = byVariantId.get(vid) || {};
+
+      const title = meta?.title || meta?.product_title || "";
+      const product_title = meta?.product_title || meta?.title || "";
+
+      // categories priority:
+      // A) meta.categories/meta.category/meta.product_type
+      // B) detect from title text
+      let cats = buildCategories(meta);
+
+      if (!cats.length) {
+        const detected = detectCategoryFromText(title, product_title);
+        if (["Mini Dress", "Midi Dress", "Maxi Dress"].includes(detected)) {
+          cats = ["Dresses", detected];
+        } else {
+          cats = [detected];
+        }
+      }
+
+      const category = cats?.[0] || "Uncategorized";
 
       return {
-        variant_id: vid,                 // (we keep it but UI won’t show it)
+        variant_id: vid,
         stock_qty: Number(r.qty ?? 0),
         updated_at: r.updated_at || null,
 
-        title: meta?.title || meta?.product_title || "",
-        product_title: meta?.product_title || meta?.title || "",
+        title,
+        product_title,
         color: meta?.color || "",
         size: meta?.size || "",
         sku: meta?.sku || "",
         image: meta?.image || null,
+
+        // ✅ FINAL
+        category,
+        categories: cats,
       };
     });
 
-    // optional: sort by title
-    items.sort((a, b) => String(a.title).localeCompare(String(b.title)));
+    // optional: sort by category then title
+    items.sort((a, b) => {
+      const ca = String(a.category || "");
+      const cb = String(b.category || "");
+      if (ca !== cb) return ca.localeCompare(cb);
+      return String(a.title || "").localeCompare(String(b.title || ""));
+    });
 
     return res.status(200).json({ ok: true, items });
   } catch (e) {
