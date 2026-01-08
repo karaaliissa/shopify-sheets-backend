@@ -1292,7 +1292,7 @@ async function handleInventorySearch(req, res) {
 
     const { rows } = await pool().query(
       `
-      select variant_id, qty, updated_at
+      select variant_id, qty, updated_at, note
       from inventory_stock
       where variant_id in (${placeholders.join(",")})
       `,
@@ -1311,7 +1311,7 @@ async function handleInventorySearch(req, res) {
         stock_qty: Number(st?.qty ?? 0),
         reserved_qty: 0, // optional (if you don't have it yet)
         updated_at: st?.updated_at || null,
-
+        note: String(st?.note || ""),
         // ✅ metadata
         title: meta?.title || "",
         product_title: meta?.product_title || meta?.title || "",
@@ -1417,6 +1417,32 @@ function titleCase(s) {
     .join(" ")
     .trim();
 }
+async function handleInventoryNote(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  }
+
+  const shop = String(req.query?.shop || "").toLowerCase().trim(); // optional
+  const body = await readJson(req);
+
+  const variant_id = String(body?.variant_id || "").trim();
+  const note = String(body?.note || "").trim();
+
+  if (!variant_id) return res.status(400).json({ ok: false, error: "missing_variant_id" });
+
+  await pool().query(
+    `
+  insert into inventory_stock(variant_id, qty, note, updated_at)
+  values ($1, 0, NULLIF($2,''), now())
+  on conflict (variant_id)
+  do update set note = NULLIF($2,''), updated_at = now()
+  `,
+    [variant_id, note]
+  );
+
+  return res.status(200).json({ ok: true, shop, variant_id, note: note || null });
+}
 
 // ✅ FULL handler
 async function handleInventoryAll(req, res) {
@@ -1427,7 +1453,7 @@ async function handleInventoryAll(req, res) {
     // 1) get all stock rows
     const { rows } = await pool().query(
       `
-      select variant_id, qty, updated_at
+      select variant_id, qty, updated_at, note
       from inventory_stock
       order by updated_at desc nulls last
       `
@@ -1464,7 +1490,7 @@ async function handleInventoryAll(req, res) {
         variant_id: vid,
         stock_qty: Number(r.qty ?? 0),
         updated_at: r.updated_at || null,
-
+        note: String(r.note || ""),
         title,
         product_title,
         color: meta?.color || "",
@@ -1514,6 +1540,8 @@ const server = http.createServer(async (req, res) => {
   if (p === "/api/inventory/search") return handleInventorySearch(req, r);
   if (p === "/api/inventory/set") return handleInventorySet(req, r);
   if (p === "/api/inventory/all") return handleInventoryAll(req, r);
+  if (p === "/api/inventory/note") return handleInventoryNote(req, r);
+
 
   return r.status(404).json({ ok: false, error: "Not Found" });
 });
