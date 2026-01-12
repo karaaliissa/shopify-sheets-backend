@@ -544,12 +544,15 @@ async function handleOrdersTags(req, res) {
       // ✅ Only below this point: "add" actions
       if (action !== "add") return;
       // ===== PROCESSING => deduct inventory (LOCAL DB only) =====
+      console.log("TAG ACTION", { action, normalized, shop, orderId });
       if (normalized === "processing") {
-        const rInv = await applyOrderProcessingToInventory(shop, orderId);
-
-        console.log("INVENTORY DEDUCT RESULT", rInv);
-        // ما تعمل return هون إذا بدك تكمل أي actions ثانية
-      }
+  try {
+    const rInv = await applyOrderProcessingToInventory(shop, orderId);
+    console.log("INVENTORY DEDUCT RESULT", rInv);
+  } catch (e) {
+    console.log("INVENTORY DEDUCT ERROR", e?.message || String(e));
+  }
+}
       // ===== SHIPPED => fulfill =====
       if (normalized === "shipped") {
         // optional safety: check if already fulfilled
