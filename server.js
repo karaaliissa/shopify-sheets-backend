@@ -546,10 +546,10 @@ async function handleOrdersTags(req, res) {
       // ===== PROCESSING => deduct inventory (LOCAL DB only) =====
       if (normalized === "processing") {
         const rInv = await applyOrderProcessingToInventory(shop, orderId);
+        
         console.log("INVENTORY DEDUCT RESULT", rInv);
         // ما تعمل return هون إذا بدك تكمل أي actions ثانية
       }
-
       // ===== SHIPPED => fulfill =====
       if (normalized === "shipped") {
         // optional safety: check if already fulfilled
@@ -1417,6 +1417,94 @@ function titleCase(s) {
     .join(" ")
     .trim();
 }
+async function handleInventoryReserve(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  }
+
+  const shop = String(req.query?.shop || "").toLowerCase().trim();
+  const body = await readJson(req);
+
+  const orderId = String(body?.orderId || "").trim();
+  const reserve = !!body?.reserve; // true/false
+
+  if (!shop) return res.status(400).json({ ok: false, error: "missing_shop" });
+  if (!orderId) return res.status(400).json({ ok: false, error: "missing_orderId" });
+
+  // ✅ block if Complete (no return)
+  const { rows: oRows } = await pool().query(
+    `select tags from tbl_order where shop_domain=$1 and order_id=$2`,
+    [shop, orderId]
+  );
+  if (!oRows?.length) return res.status(404).json({ ok: false, error: "order_not_found" });
+
+  const tags = String(oRows[0].tags || "").toLowerCase();
+  if (tags.includes("complete")) {
+    return res.status(400).json({ ok: false, error: "order_complete_cannot_change_reserve" });
+  }
+  // (اختياري) اقفل كمان لو Processing موجود
+  if (tags.includes("processing")) {
+    return res.status(400).json({ ok: false, error: "order_processing_locked" });
+  }
+
+  if (!reserve) {
+    // ✅ unreserve: delete rows
+    await pool().query(
+      `delete from inventory_reserve where shop_domain=$1 and order_id=$2`,
+      [shop, orderId]
+    );
+    return res.status(200).json({ ok: true, reserved: false });
+  }
+
+  // ✅ reserve: copy quantities from tbl_order_line_item into inventory_reserve
+  // نجمع per variant_id
+  const { rows: items } = await pool().query(
+    `
+    select variant_id, sum(quantity)::int as qty
+    from tbl_order_line_item
+    where shop_domain=$1 and order_id=$2
+    group by variant_id
+    `,
+    [shop, orderId]
+  );
+
+  const client = await pool().connect();
+  try {
+    await client.query("BEGIN");
+
+    // replace reserves for that order
+    await client.query(
+      `delete from inventory_reserve where shop_domain=$1 and order_id=$2`,
+      [shop, orderId]
+    );
+
+    for (const it of items) {
+      const variant_id = String(it.variant_id || "").trim();
+      const qty = Number(it.qty || 0);
+      if (!variant_id || qty <= 0) continue;
+
+      await client.query(
+        `
+        insert into inventory_reserve(shop_domain, order_id, variant_id, qty, updated_at)
+        values ($1,$2,$3,$4, now())
+        on conflict (shop_domain, order_id, variant_id)
+        do update set qty=excluded.qty, updated_at=now()
+        `,
+        [shop, orderId, variant_id, qty]
+      );
+    }
+
+    await client.query("COMMIT");
+    return res.status(200).json({ ok: true, reserved: true, reserved_items: items.length });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch { }
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  } finally {
+    client.release();
+  }
+}
+
 async function handleInventoryNote(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -1537,6 +1625,7 @@ const server = http.createServer(async (req, res) => {
   if (p === "/api/orders/note-local") return handleNoteLocal(req, r);
   if (p === "/api/orders/fulfill") return handleOrdersFulfill(req, r);
   if (p === "/api/inventory/import") return handleInventoryImport(req, r);
+  if (p === "/api/inventory/reserve") return handleInventoryReserve(req, r);
   if (p === "/api/inventory/search") return handleInventorySearch(req, r);
   if (p === "/api/inventory/set") return handleInventorySet(req, r);
   if (p === "/api/inventory/all") return handleInventoryAll(req, r);
