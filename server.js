@@ -546,7 +546,7 @@ async function handleOrdersTags(req, res) {
       // ===== PROCESSING => deduct inventory (LOCAL DB only) =====
       if (normalized === "processing") {
         const rInv = await applyOrderProcessingToInventory(shop, orderId);
-        
+
         console.log("INVENTORY DEDUCT RESULT", rInv);
         // ما تعمل return هون إذا بدك تكمل أي actions ثانية
       }
@@ -742,16 +742,19 @@ async function handleOrderItems(req, res) {
     return res.status(400).json({ ok: false, error: "Missing shop/order_id" });
 
   const { rows } = await pool().query(
-    `SELECT title as "TITLE",
-            variant_title as "VARIANT_TITLE",
-            quantity as "QUANTITY",
-            fulfillable_quantity as "FULFILLABLE_QUANTITY",
-            sku as "SKU",
-            image as "IMAGE",
-            unit_price as "UNIT_PRICE",
-            line_total as "LINE_TOTAL",
-            currency as "CURRENCY",
-            properties_json as "PROPERTIES_JSON"
+    `SELECT 
+        line_id as "LINE_ID",
+        variant_id as "VARIANT_ID",
+        title as "TITLE",
+        variant_title as "VARIANT_TITLE",
+        quantity as "QUANTITY",
+        fulfillable_quantity as "FULFILLABLE_QUANTITY",
+        sku as "SKU",
+        image as "IMAGE",
+        unit_price as "UNIT_PRICE",
+        line_total as "LINE_TOTAL",
+        currency as "CURRENCY",
+        properties_json as "PROPERTIES_JSON"
      FROM tbl_order_line_item
      WHERE shop_domain=$1 AND order_id=$2
      ORDER BY line_id ASC`,
@@ -760,6 +763,7 @@ async function handleOrderItems(req, res) {
 
   return res.status(200).json({ ok: true, items: rows || [] });
 }
+
 async function handleDeliverBy(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -1427,12 +1431,18 @@ async function handleInventoryReserve(req, res) {
   const body = await readJson(req);
 
   const orderId = String(body?.orderId || "").trim();
-  const reserve = !!body?.reserve; // true/false
+  const reserve = !!body?.reserve;
+
+  // NEW: item-level
+  const oneVariant = String(body?.variant_id || "").trim();
+  const manyVariants = Array.isArray(body?.variant_ids)
+    ? body.variant_ids.map((x) => String(x || "").trim()).filter(Boolean)
+    : [];
 
   if (!shop) return res.status(400).json({ ok: false, error: "missing_shop" });
   if (!orderId) return res.status(400).json({ ok: false, error: "missing_orderId" });
 
-  // ✅ block if Complete (no return)
+  // ---- lock rules (same as you had)
   const { rows: oRows } = await pool().query(
     `select tags from tbl_order where shop_domain=$1 and order_id=$2`,
     [shop, orderId]
@@ -1443,47 +1453,125 @@ async function handleInventoryReserve(req, res) {
   if (tags.includes("complete")) {
     return res.status(400).json({ ok: false, error: "order_complete_cannot_change_reserve" });
   }
-  // (اختياري) اقفل كمان لو Processing موجود
   if (tags.includes("processing")) {
     return res.status(400).json({ ok: false, error: "order_processing_locked" });
   }
 
-  if (!reserve) {
-    // ✅ unreserve: delete rows
-    await pool().query(
-      `delete from inventory_reserve where shop_domain=$1 and order_id=$2`,
+  // ---- decide target variants
+  let targetVariantIds = [];
+  if (oneVariant) targetVariantIds = [oneVariant];
+  else if (manyVariants.length) targetVariantIds = manyVariants;
+
+  // If no variants provided => fallback to "ALL variants in order" (old behavior)
+  if (!targetVariantIds.length) {
+    const { rows } = await pool().query(
+      `select distinct variant_id
+       from tbl_order_line_item
+       where shop_domain=$1 and order_id=$2 and coalesce(variant_id,'')<>''`,
       [shop, orderId]
     );
-    return res.status(200).json({ ok: true, reserved: false });
+    targetVariantIds = rows.map((r) => String(r.variant_id || "").trim()).filter(Boolean);
   }
 
-  // ✅ reserve: copy quantities from tbl_order_line_item into inventory_reserve
-  // نجمع per variant_id
-  const { rows: items } = await pool().query(
-    `
-    select variant_id, sum(quantity)::int as qty
-    from tbl_order_line_item
-    where shop_domain=$1 and order_id=$2
-    group by variant_id
-    `,
-    [shop, orderId]
-  );
+  if (!targetVariantIds.length) {
+    return res.status(200).json({ ok: true, reserved: false, changed: 0, message: "no_variants" });
+  }
 
   const client = await pool().connect();
   try {
     await client.query("BEGIN");
 
-    // replace reserves for that order
-    await client.query(
-      `delete from inventory_reserve where shop_domain=$1 and order_id=$2`,
-      [shop, orderId]
-    );
+    // For each variant: find qty in order (sum), then reserve/unreserve that qty
+    let changed = 0;
 
-    for (const it of items) {
-      const variant_id = String(it.variant_id || "").trim();
-      const qty = Number(it.qty || 0);
-      if (!variant_id || qty <= 0) continue;
+    for (const variant_id of targetVariantIds) {
+      // qty requested by this order for this variant
+      const { rows: qRows } = await client.query(
+        `
+        select coalesce(sum(quantity),0)::int as qty
+        from tbl_order_line_item
+        where shop_domain=$1 and order_id=$2 and variant_id=$3
+        `,
+        [shop, orderId, variant_id]
+      );
+      const qty = Number(qRows?.[0]?.qty || 0);
+      if (!qty || qty <= 0) continue;
 
+      // ensure stock row exists
+      await client.query(
+        `
+        insert into inventory_stock(variant_id, qty, updated_at)
+        values ($1, 0, now())
+        on conflict (variant_id) do nothing
+        `,
+        [variant_id]
+      );
+
+      if (!reserve) {
+        // ---- UNRESERVE this variant (only if reserved exists)
+        const { rows: rRows } = await client.query(
+          `
+          select qty
+          from inventory_reserve
+          where shop_domain=$1 and order_id=$2 and variant_id=$3
+          for update
+          `,
+          [shop, orderId, variant_id]
+        );
+
+        const reservedQty = Number(rRows?.[0]?.qty || 0);
+        if (reservedQty > 0) {
+          // delete reserve row
+          await client.query(
+            `delete from inventory_reserve where shop_domain=$1 and order_id=$2 and variant_id=$3`,
+            [shop, orderId, variant_id]
+          );
+
+          // add back to stock
+          await client.query(
+            `
+            update inventory_stock
+            set qty = qty + $2, updated_at = now()
+            where variant_id = $1
+            `,
+            [variant_id, reservedQty]
+          );
+
+          changed++;
+        }
+
+        continue;
+      }
+
+      // ---- RESERVE this variant
+      // check already reserved
+      const { rows: existing } = await client.query(
+        `
+        select qty
+        from inventory_reserve
+        where shop_domain=$1 and order_id=$2 and variant_id=$3
+        for update
+        `,
+        [shop, orderId, variant_id]
+      );
+
+      const already = Number(existing?.[0]?.qty || 0);
+      if (already > 0) {
+        // already reserved -> keep (idempotent)
+        continue;
+      }
+
+      // subtract from stock (clamp to 0 if you want)
+      await client.query(
+        `
+        update inventory_stock
+        set qty = greatest(qty - $2, 0), updated_at = now()
+        where variant_id = $1
+        `,
+        [variant_id, qty]
+      );
+
+      // write reserve row
       await client.query(
         `
         insert into inventory_reserve(shop_domain, order_id, variant_id, qty, updated_at)
@@ -1493,10 +1581,17 @@ async function handleInventoryReserve(req, res) {
         `,
         [shop, orderId, variant_id, qty]
       );
+
+      changed++;
     }
 
     await client.query("COMMIT");
-    return res.status(200).json({ ok: true, reserved: true, reserved_items: items.length });
+    return res.status(200).json({
+      ok: true,
+      reserved: reserve,
+      changed,
+      variant_ids: targetVariantIds,
+    });
   } catch (e) {
     try { await client.query("ROLLBACK"); } catch { }
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
@@ -1504,6 +1599,7 @@ async function handleInventoryReserve(req, res) {
     client.release();
   }
 }
+
 
 async function handleInventoryNote(req, res) {
   if (req.method !== "POST") {

@@ -70,10 +70,10 @@ export async function applyOrderProcessingToInventory(shop, orderId) {
 
             applied++;
         }
-await client.query(
-  `delete from inventory_reserve where shop_domain=$1 and order_id=$2`,
-  [shopDomain, oid]
-);
+        await client.query(
+            `delete from inventory_reserve where shop_domain=$1 and order_id=$2`,
+            [shopDomain, oid]
+        );
 
         await client.query("COMMIT");
         return { ok: true, applied };
