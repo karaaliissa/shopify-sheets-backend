@@ -517,10 +517,8 @@ async function handleOrdersTags(req, res) {
   if (action === "add" && normalized === "processing") {
     try {
       invResult = await applyOrderProcessingToInventory(shop, orderId);
-      console.log("INVENTORY DEDUCT RESULT", invResult);
     } catch (e) {
       invResult = { ok: false, error: e?.message || String(e) };
-      console.log("INVENTORY DEDUCT ERROR", invResult.error);
     }
   }
 
@@ -529,14 +527,12 @@ async function handleOrdersTags(req, res) {
     try {
       const token = process.env.SHOPIFY_ADMIN_TOKEN;
       if (!token) {
-        console.log("SHOPIFY ACTION ERROR: Missing SHOPIFY_ADMIN_TOKEN");
         return;
       }
 
       // remove shipped => cancel fulfillments
       if (action === "remove" && normalized === "shipped") {
         const r0 = await unfulfillOrder(shop, orderId);
-        console.log("UNFULFILL RESULT", r0);
         return;
       }
 
@@ -553,15 +549,11 @@ async function handleOrdersTags(req, res) {
 
           const fStatus = String(o.json?.order?.fulfillment_status || "").toLowerCase();
           if (fStatus === "fulfilled") {
-            console.log("Already fulfilled, skip fulfill", { orderId, fStatus });
           } else {
             const r1 = await fulfillOrderAllItems(shop, orderId);
-            console.log("FULFILL RESULT", r1);
           }
         } catch (e) {
-          console.log("FULFILL PRECHECK ERROR", e?.message || String(e));
           const r1 = await fulfillOrderAllItems(shop, orderId);
-          console.log("FULFILL RESULT", r1);
         }
         return;
       }
@@ -575,15 +567,12 @@ async function handleOrdersTags(req, res) {
 
         const fin = String(o.json?.order?.financial_status || "").toLowerCase();
         if (fin === "paid" || fin === "partially_paid") {
-          console.log("Already paid, skip mark paid", { orderId, fin });
         } else {
           const r2 = await markOrderAsPaid(shop, orderId);
-          console.log("PAID RESULT", r2);
         }
         return;
       }
     } catch (e) {
-      console.log("SHOPIFY ACTION ERROR", e?.message || String(e));
     }
   })();
 
@@ -1320,7 +1309,6 @@ async function handleInventorySearch(req, res) {
 
     return res.status(200).json({ ok: true, items: items.slice(0, limit) });
   } catch (e) {
-    console.log("inventory/search error", e?.message || e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 }
@@ -1691,7 +1679,6 @@ async function handleInventoryAll(req, res) {
 
     return res.status(200).json({ ok: true, items });
   } catch (e) {
-    console.log("inventory/all error", e?.message || e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 }
@@ -1726,6 +1713,4 @@ const server = http.createServer(async (req, res) => {
 
 const port = process.env.PORT || 3000;
 server.listen(port, () => {
-  console.log("Backend listening on", port);
-  console.log("DB:", process.env.DATABASE_URL ? "OK" : "MISSING");
 });
