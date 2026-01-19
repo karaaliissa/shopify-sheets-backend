@@ -50,7 +50,12 @@ export function normalizeOrderPayload(payload, shopDomain) {
     PAYMENT_GATEWAY: o.payment_gateway_names?.[0] ?? "",
     SHIPPING_METHOD: shippingLine.title ?? "",
     TAGS: (o.tags ?? "")?.toString(),
-    TOTAL: o.total_price ?? "",
+    TOTAL:
+      o.current_total_price ??
+      o.current_total_price_set?.shop_money?.amount ??
+      o.total_price ??
+      o.total_price_set?.shop_money?.amount ??
+      "",
     CURRENCY: o.currency ?? "",
     CUSTOMER_EMAIL: o?.email ?? o?.customer?.email ?? "",
     NOTE: (o.note ?? "")?.toString(),
