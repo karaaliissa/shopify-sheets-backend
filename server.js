@@ -435,13 +435,9 @@ async function handleOrdersTags(req, res) {
   }
 
   const f = await readForm(req);
-  const shop = String(f.shop || "")
-    .toLowerCase()
-    .trim();
+  const shop = String(f.shop || "").toLowerCase().trim();
   const orderId = String(f.orderId || "").trim();
-  const action = String(f.action || "")
-    .toLowerCase()
-    .trim(); // add/remove
+  const action = String(f.action || "").toLowerCase().trim(); // add/remove
   const tagRaw = String(f.tag || "").trim();
 
   if (!shop || !orderId) {
@@ -456,7 +452,6 @@ async function handleOrdersTags(req, res) {
 
   const client = await pool().connect();
 
-  // We’ll compute these so we can use them after COMMIT
   let nextTags = [];
   let tagsStr = "";
   let normalized = "";
@@ -464,7 +459,6 @@ async function handleOrdersTags(req, res) {
   try {
     await client.query("BEGIN");
 
-    // lock row
     const { rows } = await client.query(
       `SELECT tags
        FROM tbl_order
@@ -479,30 +473,23 @@ async function handleOrdersTags(req, res) {
     }
 
     const currentTags = normalizeTagsForStore(parseTags(rows[0].tags));
-
     const tag = titleCaseTag(tagRaw);
     normalized = tag.toLowerCase();
 
-    // Apply action
     if (action === "add") {
       if (!currentTags.some((t) => t.toLowerCase() === normalized)) {
         currentTags.push(tag);
       }
-      // ✅ IMPORTANT: for add, nextTags must reflect currentTags
       nextTags = currentTags.slice();
     } else {
-      // remove
       const beforeLen = currentTags.length;
       nextTags = currentTags.filter((t) => t.toLowerCase() !== normalized);
-      // if nothing removed, keep as-is
       if (nextTags.length === beforeLen) nextTags = currentTags.slice();
     }
 
-    // normalize + serialize
     nextTags = normalizeTagsForStore(nextTags);
     tagsStr = serializeTags(nextTags);
 
-    // Update DB tags
     await client.query(
       `UPDATE tbl_order
        SET tags = NULLIF($3,'')
@@ -525,7 +512,19 @@ async function handleOrdersTags(req, res) {
     } catch { }
   }
 
-  // ✅ AFTER COMMIT: trigger Shopify actions (do NOT block response if it fails)
+  // ✅ 1) LOCAL inventory deduct for Processing (do it ONCE, and return result)
+  let invResult = null;
+  if (action === "add" && normalized === "processing") {
+    try {
+      invResult = await applyOrderProcessingToInventory(shop, orderId);
+      console.log("INVENTORY DEDUCT RESULT", invResult);
+    } catch (e) {
+      invResult = { ok: false, error: e?.message || String(e) };
+      console.log("INVENTORY DEDUCT ERROR", invResult.error);
+    }
+  }
+
+  // ✅ 2) Shopify actions in background (NOT processing)
   (async () => {
     try {
       const token = process.env.SHOPIFY_ADMIN_TOKEN;
@@ -534,42 +533,27 @@ async function handleOrdersTags(req, res) {
         return;
       }
 
-      // ✅ REMOVE SHIPPED => cancel fulfillment(s) (undo shipped in Shopify)
+      // remove shipped => cancel fulfillments
       if (action === "remove" && normalized === "shipped") {
         const r0 = await unfulfillOrder(shop, orderId);
         console.log("UNFULFILL RESULT", r0);
         return;
       }
 
-      // ✅ Only below this point: "add" actions
+      // only add actions
       if (action !== "add") return;
-      // ===== PROCESSING => deduct inventory (LOCAL DB only) =====
-      console.log("TAG ACTION", { action, normalized, shop, orderId });
-      if (normalized === "processing") {
-  try {
-    const rInv = await applyOrderProcessingToInventory(shop, orderId);
-    console.log("INVENTORY DEDUCT RESULT", rInv);
-  } catch (e) {
-    console.log("INVENTORY DEDUCT ERROR", e?.message || String(e));
-  }
-}
-      // ===== SHIPPED => fulfill =====
+
+      // shipped => fulfill
       if (normalized === "shipped") {
-        // optional safety: check if already fulfilled
         try {
           const oUrl = `${shopifyBase(shop)}/orders/${orderId}.json`;
           const o = await httpsReqJson(oUrl, "GET", {
             "X-Shopify-Access-Token": token,
           });
 
-          const fStatus = String(
-            o.json?.order?.fulfillment_status || ""
-          ).toLowerCase();
+          const fStatus = String(o.json?.order?.fulfillment_status || "").toLowerCase();
           if (fStatus === "fulfilled") {
-            console.log("Already fulfilled, skip fulfill", {
-              orderId,
-              fStatus,
-            });
+            console.log("Already fulfilled, skip fulfill", { orderId, fStatus });
           } else {
             const r1 = await fulfillOrderAllItems(shop, orderId);
             console.log("FULFILL RESULT", r1);
@@ -582,9 +566,8 @@ async function handleOrdersTags(req, res) {
         return;
       }
 
-      // ===== COMPLETE => mark paid =====
+      // complete => mark paid
       if (normalized === "complete") {
-        // safety: skip if already paid
         const oUrl = `${shopifyBase(shop)}/orders/${orderId}.json`;
         const o = await httpsReqJson(oUrl, "GET", {
           "X-Shopify-Access-Token": token,
@@ -604,15 +587,17 @@ async function handleOrdersTags(req, res) {
     }
   })();
 
-  // ✅ Response immediately (DB updated already)
+  // ✅ Response
   return res.status(200).json({
     ok: true,
     shop,
     order_id: orderId,
     tags: nextTags,
     tags_str: tagsStr,
+    inventory: invResult, // ✅ now you see it
   });
 }
+
 
 function decodeCursor(s) {
   try {
@@ -1464,6 +1449,11 @@ async function handleInventoryReserve(req, res) {
   let targetVariantIds = [];
   if (oneVariant) targetVariantIds = [oneVariant];
   else if (manyVariants.length) targetVariantIds = manyVariants;
+  targetVariantIds = targetVariantIds.map((v) => {
+    const s = String(v || "").trim();
+    const m = s.match(/ProductVariant\/(\d+)/i);
+    return m ? m[1] : s;
+  });
 
   // If no variants provided => fallback to "ALL variants in order" (old behavior)
   if (!targetVariantIds.length) {
