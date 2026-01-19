@@ -75,39 +75,43 @@ export function normalizeOrderPayload(payload, shopDomain) {
   };
 
   const lineItems = Array.isArray(o.line_items)
-    ? o.line_items.map((li) => {
-      const qty = Number(li.quantity ?? 0);
-      const unit = Number(li.price_set?.shop_money?.amount ?? li.price ?? 0);
-      const currency =
-        li.price_set?.shop_money?.currency_code ?? o.currency ?? "";
+    ? o.line_items
+      .map((li) => {
+        const qty = Number(li.current_quantity ?? li.quantity ?? 0);
+        const unit = Number(li.price_set?.shop_money?.amount ?? li.price ?? 0);
+        const currency =
+          li.price_set?.shop_money?.currency_code ?? o.currency ?? "";
 
-      const lineId =
-        String(li.id ?? "") ||
-        `no_line_id_${String(
-          li.variant_id ?? li.product_id ?? li.title ?? "x"
-        ).slice(0, 40)}`;
+        const lineId =
+          String(li.id ?? "") ||
+          `no_line_id_${String(
+            li.variant_id ?? li.product_id ?? li.title ?? "x"
+          ).slice(0, 40)}`;
 
-      return {
-        SHOP_DOMAIN: order.SHOP_DOMAIN,
-        ORDER_ID: order.ORDER_ID,
-        LINE_ID: lineId,
-        TITLE: li.title ?? "",
-        VARIANT_TITLE: li.variant_title ?? "",
-        QUANTITY: qty,
-        FULFILLABLE_QUANTITY: Number(
-          li.fulfillable_quantity ?? li.quantity ?? 0
-        ),
-        SKU: li.sku ?? "",
-        IMAGE: li?.image?.src ?? "",
-        PRODUCT_ID: String(li.product_id ?? ""),
-        VARIANT_ID: String(li.variant_id ?? ""),
-        UNIT_PRICE: unit,
-        LINE_TOTAL: unit * qty,
-        CURRENCY: currency,
-        PROPERTIES_JSON: JSON.stringify(li.properties ?? []),
-      };
-    })
+        return {
+          SHOP_DOMAIN: order.SHOP_DOMAIN,
+          ORDER_ID: order.ORDER_ID,
+          LINE_ID: lineId,
+          TITLE: li.title ?? "",
+          VARIANT_TITLE: li.variant_title ?? "",
+          QUANTITY: qty,
+          FULFILLABLE_QUANTITY: Number(
+            li.fulfillable_quantity ?? li.current_quantity ?? li.quantity ?? 0
+          ),
+          SKU: li.sku ?? "",
+          IMAGE: li?.image?.src ?? "",
+          PRODUCT_ID: String(li.product_id ?? ""),
+          VARIANT_ID: String(li.variant_id ?? ""),
+          UNIT_PRICE: unit,
+          LINE_TOTAL: unit * qty,
+          CURRENCY: currency,
+          PROPERTIES_JSON: JSON.stringify(li.properties ?? []),
+        };
+      })
+      // ✅ remove "Removed" items
+      .filter((x) => Number(x.QUANTITY || 0) > 0)
     : [];
+
 
   return { order, lineItems };
 }

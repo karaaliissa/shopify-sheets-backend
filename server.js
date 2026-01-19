@@ -1030,64 +1030,64 @@ async function handleWebhookShopify(req, res) {
   }
 
   // ========================
-//  D) Orders/updated webhook  ✅ (THIS IS THE EDIT SYNC)
-// ========================
-if (topic === "orders/updated") {
-  const { order, lineItems } = normalizeOrderPayload(payload, shopDomain);
+  //  D) Orders/updated webhook  ✅ (THIS IS THE EDIT SYNC)
+  // ========================
+  if (topic === "orders/updated") {
+    const { order, lineItems } = normalizeOrderPayload(payload, shopDomain);
 
-  if (!order?.SHOP_DOMAIN || !order?.ORDER_ID) {
-    return res.status(200).json({
-      ok: true,
-      skipped: true,
-      reason: "Missing ORDER_ID/SHOP_DOMAIN",
-    });
-  }
-
-  const client = await pool().connect();
-  let errMsg = "";
-
-  try {
-    await client.query("BEGIN");
-
-    // ✅ update order fields (tags, totals, shipping, statuses, etc.)
-    await upsertOrderTx(client, order);
-
-    // ✅ enrich images if missing (same as create)
-    const imgCache = new Map();
-    for (const li of lineItems) {
-      if (String(li.IMAGE || "").trim()) continue;
-      const pid = li.PRODUCT_ID;
-      if (!pid) continue;
-
-      if (!imgCache.has(pid)) {
-        imgCache.set(pid, fetchProductImage(order.SHOP_DOMAIN, pid));
-      }
-      li.IMAGE = await imgCache.get(pid);
+    if (!order?.SHOP_DOMAIN || !order?.ORDER_ID) {
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "Missing ORDER_ID/SHOP_DOMAIN",
+      });
     }
 
-    // ✅ IMPORTANT: replace items so Shopify edits reflect in DB
-    await replaceLineItemsTx(client, order.SHOP_DOMAIN, order.ORDER_ID, lineItems);
+    const client = await pool().connect();
+    let errMsg = "";
 
-    await client.query("COMMIT");
-  } catch (e) {
-    errMsg = e?.message || String(e);
-    try { await client.query("ROLLBACK"); } catch {}
-  } finally {
-    client.release();
+    try {
+      await client.query("BEGIN");
+
+      // ✅ update order fields (tags, totals, shipping, statuses, etc.)
+      await upsertOrderTx(client, order);
+
+      // ✅ enrich images if missing (same as create)
+      const imgCache = new Map();
+      for (const li of lineItems) {
+        if (String(li.IMAGE || "").trim()) continue;
+        const pid = li.PRODUCT_ID;
+        if (!pid) continue;
+
+        if (!imgCache.has(pid)) {
+          imgCache.set(pid, fetchProductImage(order.SHOP_DOMAIN, pid));
+        }
+        li.IMAGE = await imgCache.get(pid);
+      }
+
+      // ✅ IMPORTANT: replace items so Shopify edits reflect in DB
+      await replaceLineItemsTx(client, order.SHOP_DOMAIN, order.ORDER_ID, lineItems);
+
+      await client.query("COMMIT");
+    } catch (e) {
+      errMsg = e?.message || String(e);
+      try { await client.query("ROLLBACK"); } catch { }
+    } finally {
+      client.release();
+    }
+
+    if (errMsg) {
+      return res.status(500).json({ ok: false, error: errMsg });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      topic,
+      order_id: order.ORDER_ID,
+      items: lineItems.length,
+      updated: true,
+    });
   }
-
-  if (errMsg) {
-    return res.status(500).json({ ok: false, error: errMsg });
-  }
-
-  return res.status(200).json({
-    ok: true,
-    topic,
-    order_id: order.ORDER_ID,
-    items: lineItems.length,
-    updated: true,
-  });
-}
 
   // Should never reach here (topics are already filtered)
   return res.status(200).json({ ok: true, ignored: true, topic });
