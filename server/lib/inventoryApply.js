@@ -39,10 +39,10 @@ export async function applyOrderProcessingToInventory(shop, orderId) {
   try {
     await client.query("BEGIN");
 
-for (const it of items) {
-  const variant_id = String(it.variant_id || "").trim();
-  const qty = Number(it.qty ?? 0);
-  if (!variant_id || qty <= 0) continue;
+    for (const it of items) {
+      const variant_id = String(it.variant_id || "").trim();
+      const qty = Number(it.qty ?? 0);
+      if (!variant_id || qty <= 0) continue;
 
       // idempotent move
       const ins = await client.query(
@@ -86,7 +86,7 @@ for (const it of items) {
     await client.query("COMMIT");
     return { ok: true, applied, items };
   } catch (e) {
-    try { await client.query("ROLLBACK"); } catch {}
+    try { await client.query("ROLLBACK"); } catch { }
     return { ok: false, error: e?.message || String(e) };
   } finally {
     client.release();

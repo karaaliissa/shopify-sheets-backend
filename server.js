@@ -795,10 +795,12 @@ async function handleWebhookShopify(req, res) {
 
   // 3) Allow only needed topics
   const allowedTopics = new Set([
-    "orders/create",
     "fulfillments/create",
     "fulfillments/update",
     "fulfillments/cancelled",
+    "orders/create",
+    "orders/updated",
+    "orders/cancelled"
   ]);
 
   if (!allowedTopics.has(topic)) {
@@ -992,44 +994,171 @@ async function handleWebhookShopify(req, res) {
       items: lineItems.length,
     });
   }
+  // ========================
+  //  C) Orders/cancelled webhook
+  // ========================
+  if (topic === "orders/cancelled") {
+    // Shopify cancellation payload is the Order object (same shape as orders/create)
+    const { order, lineItems } = normalizeOrderPayload(payload, shopDomain);
+
+    if (!order?.SHOP_DOMAIN || !order?.ORDER_ID) {
+      return res.status(200).json({ ok: true, skipped: true, reason: "missing ids" });
+    }
+
+    const client = await pool().connect();
+    try {
+      await client.query("BEGIN");
+
+      // ✅ update order row (cancelled_at will be set)
+      await upsertOrderTx(client, order);
+
+      // ✅ add/remove Cancelled tag in your DB
+      await applyCancelledFromShopify(client, order.SHOP_DOMAIN, order.ORDER_ID, true);
+
+      // ✅ OPTIONAL: inventory release if you had reserved
+      // If you want cancellation to "unreserve" stock:
+      await releaseReserveForOrderTx(client, order.SHOP_DOMAIN, order.ORDER_ID);
+
+      await client.query("COMMIT");
+      return res.status(200).json({ ok: true, topic, order_id: order.ORDER_ID });
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch { }
+      return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    } finally {
+      client.release();
+    }
+  }
 
   // Should never reach here (topics are already filtered)
   return res.status(200).json({ ok: true, ignored: true, topic });
 }
 
-async function applyShippedFromShopify(client, shop, orderId, shouldBeShipped) {
-  // lock row
+async function applyCancelledFromShopify(client, shop, orderId, isCancelled) {
   const { rows } = await client.query(
-    `SELECT tags
-     FROM tbl_order
-     WHERE shop_domain=$1 AND order_id=$2
-     FOR UPDATE`,
+    `SELECT tags FROM tbl_order WHERE shop_domain=$1 AND order_id=$2 FOR UPDATE`,
     [shop, orderId]
   );
-
   if (!rows?.length) return { ok: false, reason: "order_not_found" };
 
   const current = normalizeTagsForStore(parseTags(rows[0].tags));
-  const hasShipped = current.some((t) => t.toLowerCase() === "shipped");
+  const hasCancelled = current.some((t) => t.toLowerCase() === "cancelled");
 
   let next = current.slice();
-
-  if (shouldBeShipped && !hasShipped) next.push("Shipped");
-  if (!shouldBeShipped && hasShipped)
-    next = next.filter((t) => t.toLowerCase() !== "shipped");
+  if (isCancelled && !hasCancelled) next.push("Cancelled");
+  if (!isCancelled && hasCancelled)
+    next = next.filter((t) => t.toLowerCase() !== "cancelled");
 
   next = normalizeTagsForStore(next);
   const tagsStr = serializeTags(next);
 
   await client.query(
-    `UPDATE tbl_order
-     SET tags = NULLIF($3,'')
-     WHERE shop_domain=$1 AND order_id=$2`,
+    `UPDATE tbl_order SET tags = NULLIF($3,'') WHERE shop_domain=$1 AND order_id=$2`,
     [shop, orderId, tagsStr]
   );
 
   return { ok: true, tags: next, tags_str: tagsStr };
 }
+async function releaseReserveForOrderTx(client, shop, orderId) {
+  const { rows } = await client.query(
+    `select variant_id, qty
+     from inventory_reserve
+     where shop_domain=$1 and order_id=$2
+     for update`,
+    [shop, orderId]
+  );
+
+  if (!rows?.length) return { ok: true, released: 0 };
+
+  let released = 0;
+
+  for (const r of rows) {
+    const variant_id = String(r.variant_id || "").trim();
+    const qty = Number(r.qty || 0);
+    if (!variant_id || qty <= 0) continue;
+
+    await client.query(
+      `update inventory_stock
+       set qty = qty + $2, updated_at = now()
+       where variant_id = $1`,
+      [variant_id, qty]
+    );
+
+    released++;
+  }
+
+  await client.query(
+    `delete from inventory_reserve where shop_domain=$1 and order_id=$2`,
+    [shop, orderId]
+  );
+
+  return { ok: true, released };
+}
+async function cancelShopifyOrder(shopDomain, orderId, reason = "customer") {
+  const token = process.env.SHOPIFY_ADMIN_TOKEN;
+  if (!token) throw new Error("Missing SHOPIFY_ADMIN_TOKEN");
+
+  const url = `${shopifyBase(shopDomain)}/orders/${orderId}/cancel.json`;
+
+  // Shopify supports a JSON body with reason/notify/refund (depends on version),
+  // keep minimal to avoid errors:
+  const r = await httpsReqJson(
+    url,
+    "POST",
+    { "X-Shopify-Access-Token": token },
+    { reason } // you can add notify_customer/refund if you want
+  );
+
+  if (!r.ok) {
+    throw new Error(`Order cancel failed (${r.status}): ${String(r.data).slice(0, 200)}`);
+  }
+
+  return r.json?.order || null;
+}
+async function handleOrdersCancel(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  }
+
+  const f = await readForm(req);
+  const shop = String(f.shop || "").toLowerCase().trim();
+  const orderId = String(f.orderId || "").trim();
+  const reason = String(f.reason || "customer").trim();
+
+  if (!shop || !orderId) {
+    return res.status(400).json({ ok: false, error: "Missing shop/orderId" });
+  }
+
+  // 1) cancel on Shopify
+  const shopifyOrder = await cancelShopifyOrder(shop, orderId, reason);
+
+  // 2) mirror into DB immediately (don’t wait for webhook)
+  const client = await pool().connect();
+  try {
+    await client.query("BEGIN");
+
+    // ✅ if Shopify returned the order object, normalize it and upsert
+    if (shopifyOrder) {
+      const { order } = normalizeOrderPayload(shopifyOrder, shop);
+      await upsertOrderTx(client, order);
+    }
+
+    await applyCancelledFromShopify(client, shop, orderId, true);
+
+    // ✅ release reserve
+    await releaseReserveForOrderTx(client, shop, orderId);
+
+    await client.query("COMMIT");
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch { }
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  } finally {
+    client.release();
+  }
+
+  return res.status(200).json({ ok: true, shop, order_id: orderId });
+}
+
 // ✅ Inventory Import (CSV streaming) — handles big files safely
 async function handleInventoryImport(req, res) {
   if (req.method !== "POST") {
@@ -1706,7 +1835,7 @@ const server = http.createServer(async (req, res) => {
   if (p === "/api/inventory/set") return handleInventorySet(req, r);
   if (p === "/api/inventory/all") return handleInventoryAll(req, r);
   if (p === "/api/inventory/note") return handleInventoryNote(req, r);
-
+  if (p === "/api/orders/cancel") return handleOrdersCancel(req, r);
 
   return r.status(404).json({ ok: false, error: "Not Found" });
 });
