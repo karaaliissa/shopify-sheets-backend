@@ -458,8 +458,7 @@ async function handleOrdersTags(req, res) {
 
   try {
     await client.query("BEGIN");
-
-    const { rows } = await client.query(
+const { rows } = await client.query(
       `SELECT tags
        FROM tbl_order
        WHERE shop_domain=$1 AND order_id=$2
@@ -879,7 +878,7 @@ async function handleWebhookShopify(req, res) {
     const client = await pool().connect();
     try {
       await client.query("BEGIN");
-      const out = await applyShippedFromShopify(
+const out = await applyShippedFromShopify(
         client,
         shopDomain.toLowerCase(),
         orderId,
@@ -931,8 +930,7 @@ async function handleWebhookShopify(req, res) {
 
     try {
       await client.query("BEGIN");
-
-      await upsertOrderTx(client, order);
+await upsertOrderTx(client, order);
 
       // enrich images (cache per product to avoid spam)
       const imgCache = new Map();
@@ -1008,8 +1006,7 @@ async function handleWebhookShopify(req, res) {
     const client = await pool().connect();
     try {
       await client.query("BEGIN");
-
-      // ✅ update order row (cancelled_at will be set)
+// ✅ update order row (cancelled_at will be set)
       await upsertOrderTx(client, order);
 
       // ✅ add/remove Cancelled tag in your DB
@@ -1030,7 +1027,8 @@ async function handleWebhookShopify(req, res) {
   }
 
   // ========================
-  //  D) Orders/updated webhook  ✅ (THIS IS THE EDIT SYNC)
+  // ========================
+  //  D) Orders/updated webhook  ? (THIS IS THE EDIT SYNC)
   // ========================
   if (topic === "orders/updated") {
     const { order, lineItems } = normalizeOrderPayload(payload, shopDomain);
@@ -1049,10 +1047,34 @@ async function handleWebhookShopify(req, res) {
     try {
       await client.query("BEGIN");
 
-      // ✅ update order fields (tags, totals, shipping, statuses, etc.)
+      // ? preserve local status tags (Processing/Shipped/Complete/Cancelled) across Shopify updates
+      try {
+        const { rows: tagRows } = await client.query(
+          `SELECT tags FROM tbl_order WHERE shop_domain=$1 AND order_id=$2 FOR UPDATE`,
+          [order.SHOP_DOMAIN, order.ORDER_ID]
+        );
+
+        if (tagRows?.length) {
+          const existing = normalizeTagsForStore(parseTags(tagRows[0].tags));
+          const shopifyTags = normalizeTagsForStore(parseTags(order.TAGS));
+
+          const localKeys = new Set(["processing", "shipped", "complete", "cancelled"]);
+          const localKeep = existing.filter((t) => localKeys.has(String(t).toLowerCase()));
+          const shopifyKeep = shopifyTags.filter(
+            (t) => !localKeys.has(String(t).toLowerCase())
+          );
+
+          const merged = normalizeTagsForStore([...shopifyKeep, ...localKeep]);
+          order.TAGS = serializeTags(merged);
+        }
+      } catch {
+        // If merge fails, fall back to Shopify tags to avoid blocking webhook
+      }
+
+      // ? update order fields (tags, totals, shipping, statuses, etc.)
       await upsertOrderTx(client, order);
 
-      // ✅ enrich images if missing (same as create)
+      // ? enrich images if missing (same as create)
       const imgCache = new Map();
       for (const li of lineItems) {
         if (String(li.IMAGE || "").trim()) continue;
@@ -1065,7 +1087,7 @@ async function handleWebhookShopify(req, res) {
         li.IMAGE = await imgCache.get(pid);
       }
 
-      // ✅ IMPORTANT: replace items so Shopify edits reflect in DB
+      // ? IMPORTANT: replace items so Shopify edits reflect in DB
       await replaceLineItemsTx(client, order.SHOP_DOMAIN, order.ORDER_ID, lineItems);
 
       await client.query("COMMIT");
@@ -1218,6 +1240,7 @@ async function handleOrdersCancel(req, res) {
 
   return res.status(200).json({ ok: true, shop, order_id: orderId });
 }
+
 
 // ✅ Inventory Import (CSV streaming) — handles big files safely
 async function handleInventoryImport(req, res) {
@@ -1771,6 +1794,7 @@ async function handleInventoryReserve(req, res) {
 }
 
 
+
 async function handleInventoryNote(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -1903,3 +1927,6 @@ const server = http.createServer(async (req, res) => {
 const port = process.env.PORT || 3000;
 server.listen(port, () => {
 });
+
+
+
