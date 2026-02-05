@@ -2126,13 +2126,6 @@ function getCookie(req, name) {
   return "";
 }
 
-function clearCookie(res, name) {
-  // Render/HTTPS safe: SameSite=Lax usually ok
-  res.setHeader(
-    "Set-Cookie",
-    `${name}=; Path=/; Max-Age=0; SameSite=Lax`
-  );
-}
 async function handleWarehouseOpen(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
