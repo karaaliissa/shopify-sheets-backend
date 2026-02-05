@@ -458,7 +458,7 @@ async function handleOrdersTags(req, res) {
 
   try {
     await client.query("BEGIN");
-const { rows } = await client.query(
+    const { rows } = await client.query(
       `SELECT tags
        FROM tbl_order
        WHERE shop_domain=$1 AND order_id=$2
@@ -878,7 +878,7 @@ async function handleWebhookShopify(req, res) {
     const client = await pool().connect();
     try {
       await client.query("BEGIN");
-const out = await applyShippedFromShopify(
+      const out = await applyShippedFromShopify(
         client,
         shopDomain.toLowerCase(),
         orderId,
@@ -930,7 +930,7 @@ const out = await applyShippedFromShopify(
 
     try {
       await client.query("BEGIN");
-await upsertOrderTx(client, order);
+      await upsertOrderTx(client, order);
 
       // enrich images (cache per product to avoid spam)
       const imgCache = new Map();
@@ -1006,7 +1006,7 @@ await upsertOrderTx(client, order);
     const client = await pool().connect();
     try {
       await client.query("BEGIN");
-// ✅ update order row (cancelled_at will be set)
+      // ✅ update order row (cancelled_at will be set)
       await upsertOrderTx(client, order);
 
       // ✅ add/remove Cancelled tag in your DB
@@ -1895,7 +1895,262 @@ async function handleInventoryAll(req, res) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 }
+async function handleWarehouseQr(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  }
 
+  const f = await readForm(req);
+  const shop = String(f.shop || "").toLowerCase().trim();
+  const orderId = String(f.orderId || "").trim();
+
+  if (!shop || !orderId) {
+    return res.status(400).json({ ok: false, error: "Missing shop/orderId" });
+  }
+
+  // ensure order exists (optional but recommended)
+  const { rows } = await pool().query(
+    `select 1 as ok from tbl_order where shop_domain=$1 and order_id=$2`,
+    [shop, orderId]
+  );
+  if (!rows?.length) return res.status(404).json({ ok: false, error: "order_not_found" });
+
+  const client = await pool().connect();
+  try {
+    await client.query("BEGIN");
+
+    // if already exists, keep same token_hash (we cannot recover original token)
+    // so: if exists -> generate NEW token (simple) OR keep old and just return "already_created"
+    // We WANT to print QR, so we must return the actual token.
+    // => We'll always generate a token and store its hash (overwrite previous).
+    const token = newToken();
+    const token_hash = sha256Hex(token);
+
+    await client.query(
+      `
+      insert into tbl_order_qr (shop_domain, order_id, token_hash, created_at, last_used_at)
+      values ($1,$2,$3, now(), null)
+      on conflict (shop_domain, order_id)
+      do update set token_hash=excluded.token_hash, created_at=now(), last_used_at=null
+      `,
+      [shop, orderId, token_hash]
+    );
+
+    await client.query("COMMIT");
+
+    // QR will open this URL (frontend route later)
+    const base = String(process.env.PUBLIC_APP_URL || "").replace(/\/$/, "");
+    const url = base
+      ? `${base}/w/${encodeURIComponent(token)}`
+      : `/w/${encodeURIComponent(token)}`;
+
+    return res.status(200).json({ ok: true, shop, order_id: orderId, token, url });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch { }
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  } finally {
+    client.release();
+  }
+}
+
+
+/* ================= Warehouse QR + Workflow (AUTO) ================= */
+
+// statuses we will use (no CUT/SEW)
+const WF = {
+  READY_BOX: "READY_BOX",
+  PICKUP: "PICKUP",
+  ON_WAY: "ON_WAY",
+  SHIPPED: "SHIPPED",
+};
+
+const WF_ORDER = [WF.READY_BOX, WF.PICKUP, WF.ON_WAY, WF.SHIPPED];
+
+function sha256Hex(s) {
+  return crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
+}
+
+function newToken() {
+  // long, URL-safe
+  return crypto.randomBytes(24).toString("base64url"); // ~32 chars
+}
+
+function nextStatus(current) {
+  const cur = String(current || "").toUpperCase().trim();
+  if (!cur) return WF.READY_BOX;
+
+  const idx = WF_ORDER.indexOf(cur);
+  if (idx === -1) return WF.READY_BOX; // unknown -> reset to READY_BOX (safe)
+  if (idx >= WF_ORDER.length - 1) return cur; // already SHIPPED -> stay
+  return WF_ORDER[idx + 1];
+}
+
+async function getOrderBundleByShopOrder(client, shop, orderId) {
+  const { rows: oRows } = await client.query(
+    `select * from tbl_order where shop_domain=$1 and order_id=$2`,
+    [shop, orderId]
+  );
+
+  if (!oRows?.length) return { ok: false, error: "order_not_found" };
+
+  const { rows: iRows } = await client.query(
+    `select 
+        line_id as "LINE_ID",
+        variant_id as "VARIANT_ID",
+        title as "TITLE",
+        variant_title as "VARIANT_TITLE",
+        quantity as "QUANTITY",
+        sku as "SKU",
+        image as "IMAGE",
+        properties_json as "PROPERTIES_JSON"
+     from tbl_order_line_item
+     where shop_domain=$1 and order_id=$2
+     order by line_id asc`,
+    [shop, orderId]
+  );
+
+  const { rows: wRows } = await client.query(
+    `select status, updated_at from tbl_order_workflow where shop_domain=$1 and order_id=$2`,
+    [shop, orderId]
+  );
+
+  return {
+    ok: true,
+    order: oRows[0],
+    items: iRows || [],
+    workflow: wRows?.[0] || { status: null, updated_at: null },
+  };
+}
+async function handleWarehouseOpen(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ ok: false, error: "Method Not Allowed" });
+  }
+
+  const token = String(req.query?.token || "").trim();
+  if (!token) return res.status(400).json({ ok: false, error: "missing_token" });
+
+  const token_hash = sha256Hex(token);
+
+  const client = await pool().connect();
+  try {
+    await client.query("BEGIN");
+
+    // 1) resolve token -> shop/order
+    const { rows: tRows } = await client.query(
+      `select shop_domain, order_id
+       from tbl_order_qr
+       where token_hash=$1
+       for update`,
+      [token_hash]
+    );
+
+    if (!tRows?.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "token_not_found" });
+    }
+
+    const shop = String(tRows[0].shop_domain || "").toLowerCase();
+    const orderId = String(tRows[0].order_id || "").trim();
+
+    // (optional but nice) ensure order exists
+    const { rows: oOk } = await client.query(
+      `select 1 as ok from tbl_order where shop_domain=$1 and order_id=$2`,
+      [shop, orderId]
+    );
+    if (!oOk?.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "order_not_found" });
+    }
+
+    // 2) read current workflow status (lock)
+    const { rows: wRows } = await client.query(
+      `select status
+       from tbl_order_workflow
+       where shop_domain=$1 and order_id=$2
+       for update`,
+      [shop, orderId]
+    );
+
+    const current = String(wRows?.[0]?.status || "").toUpperCase().trim();
+    const next = String(nextStatus(current)).toUpperCase().trim();
+
+    const didAdvance = next !== current;
+
+    // 3) update workflow ONLY if it changes (auto-advance)
+    if (didAdvance) {
+      await client.query(
+        `
+        insert into tbl_order_workflow (shop_domain, order_id, status, updated_at)
+        values ($1,$2,$3, now())
+        on conflict (shop_domain, order_id)
+        do update set status=excluded.status, updated_at=now()
+        `,
+        [shop, orderId, next]
+      );
+    }
+
+    // ✅ if JUST reached SHIPPED now, mirror into tbl_order.tags and fulfill Shopify
+    if (didAdvance && next === String(WF.SHIPPED).toUpperCase()) {
+      // 1) add tag "Shipped" locally (idempotent)
+      const { rows: tagRows } = await client.query(
+        `select tags
+         from tbl_order
+         where shop_domain=$1 and order_id=$2
+         for update`,
+        [shop, orderId]
+      );
+
+      if (tagRows?.length) {
+        const currentTags = normalizeTagsForStore(parseTags(tagRows[0].tags));
+        const has = currentTags.some((t) => String(t).toLowerCase() === "shipped");
+        if (!has) currentTags.push("Shipped");
+
+        const tagsStr = serializeTags(normalizeTagsForStore(currentTags));
+
+        await client.query(
+          `update tbl_order
+           set tags = NULLIF($3,'')
+           where shop_domain=$1 and order_id=$2`,
+          [shop, orderId, tagsStr]
+        );
+      }
+
+      // 2) fulfill on Shopify in background (do NOT block response)
+      (async () => {
+        try {
+          await fulfillOrderAllItems(shop, orderId);
+        } catch { }
+      })();
+    }
+
+    // 4) update token last_used_at
+    await client.query(
+      `update tbl_order_qr set last_used_at=now() where token_hash=$1`,
+      [token_hash]
+    );
+
+    // 5) return order bundle (AFTER all updates)
+    const bundle = await getOrderBundleByShopOrder(client, shop, orderId);
+
+    await client.query("COMMIT");
+
+    return res.status(200).json({
+      ok: true,
+      shop,
+      order_id: orderId,
+      advanced_from: current || null,
+      advanced_to: next || null,
+      ...bundle,
+    });
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch { }
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  } finally {
+    client.release();
+  }
+}
 
 const server = http.createServer(async (req, res) => {
   const r = enhanceRes(res);
@@ -1920,13 +2175,11 @@ const server = http.createServer(async (req, res) => {
   if (p === "/api/inventory/all") return handleInventoryAll(req, r);
   if (p === "/api/inventory/note") return handleInventoryNote(req, r);
   if (p === "/api/orders/cancel") return handleOrdersCancel(req, r);
-
+  if (p === "/api/warehouse/qr") return handleWarehouseQr(req, r);
+  if (p === "/api/warehouse/open") return handleWarehouseOpen(req, r);
   return r.status(404).json({ ok: false, error: "Not Found" });
 });
 
 const port = process.env.PORT || 3000;
 server.listen(port, () => {
 });
-
-
-
