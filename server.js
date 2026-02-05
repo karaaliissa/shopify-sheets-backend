@@ -2022,6 +2022,117 @@ async function getOrderBundleByShopOrder(client, shop, orderId) {
     workflow: wRows?.[0] || { status: null, updated_at: null },
   };
 }
+function appendSetCookie(res, value) {
+  const prev = res.getHeader("Set-Cookie");
+  const next = Array.isArray(prev) ? [...prev, value] : prev ? [prev, value] : [value];
+  res.setHeader("Set-Cookie", next);
+}
+function setCookie(res, name, value, opts = {}) {
+  const parts = [`${name}=${encodeURIComponent(value)}`];
+  if (opts.httpOnly) parts.push("HttpOnly");
+  if (opts.sameSite) parts.push(`SameSite=${opts.sameSite}`);
+  if (opts.secure) parts.push("Secure");
+  if (opts.path) parts.push(`Path=${opts.path}`);
+  if (opts.maxAge) parts.push(`Max-Age=${opts.maxAge}`);
+  appendSetCookie(res, parts.join("; "));
+}
+function clearCookie(res, name) {
+  appendSetCookie(res, `${name}=; Path=/; Max-Age=0; SameSite=Lax`);
+}
+
+async function handleWarehouseTokenLanding(req, res, token) {
+  // store token in cookie then redirect to dummy pin page
+  const isHttps = String(req.headers["x-forwarded-proto"] || "").includes("https");
+  setCookie(res, "wh_token", token, {
+    httpOnly: true,
+    sameSite: "Lax",
+    secure: isHttps,   // important on Render
+    path: "/",
+    maxAge: 60 * 10,   // 10 min
+  });
+
+  res.statusCode = 302;
+  res.setHeader("Location", "/warehouse-scan");
+  return res.end();
+}
+async function handleWarehouseScanPage(req, res) {
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  return res.end(`
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Warehouse Scan</title>
+  <style>
+    body{font-family:system-ui;margin:24px}
+    .card{max-width:420px;margin:0 auto;border:1px solid #ddd;border-radius:14px;padding:18px}
+    input{width:100%;padding:12px;font-size:18px;border-radius:10px;border:1px solid #ccc}
+    button{width:100%;padding:12px;margin-top:10px;font-size:18px;border-radius:10px;border:0}
+    .err{color:#b00020;margin-top:10px}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Warehouse Scan</h2>
+    <p>Enter PIN</p>
+    <input id="pin" inputmode="numeric" placeholder="PIN" />
+    <button id="btn">Open</button>
+    <div id="msg" class="err"></div>
+  </div>
+
+  <script>
+    const btn = document.getElementById("btn");
+    const pin = document.getElementById("pin");
+    const msg = document.getElementById("msg");
+
+    btn.onclick = async () => {
+      msg.textContent = "";
+      const p = (pin.value || "").trim();
+      if(!p) return msg.textContent = "Enter PIN";
+
+      const form = new URLSearchParams();
+      form.set("pin", p);
+
+      const r = await fetch("/api/warehouse/open", {
+        method: "POST",
+        headers: {"Content-Type":"application/x-www-form-urlencoded"},
+        body: form.toString(),
+        credentials: "include"
+      });
+
+      const j = await r.json().catch(()=>null);
+      if(!r.ok || !j?.ok){
+        msg.textContent = j?.error || ("Error (" + r.status + ")");
+        return;
+      }
+
+      // success UX
+      document.body.innerHTML = "<h2 style='font-family:system-ui'>✅ Done</h2><p>Order marked as SHIPPED.</p>";
+    };
+  </script>
+</body>
+</html>
+  `);
+}
+
+function getCookie(req, name) {
+  const c = String(req.headers.cookie || "");
+  const parts = c.split(";").map((s) => s.trim());
+  for (const p of parts) {
+    const [k, ...rest] = p.split("=");
+    if (k === name) return decodeURIComponent(rest.join("=") || "");
+  }
+  return "";
+}
+
+function clearCookie(res, name) {
+  // Render/HTTPS safe: SameSite=Lax usually ok
+  res.setHeader(
+    "Set-Cookie",
+    `${name}=; Path=/; Max-Age=0; SameSite=Lax`
+  );
+}
 async function handleWarehouseOpen(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -2029,15 +2140,21 @@ async function handleWarehouseOpen(req, res) {
   }
 
   const f = await readForm(req);
-  const token = String(f.token || "").trim();
   const pin = String(f.pin || "").trim();
-
-  if (!token) return res.status(400).json({ ok: false, error: "missing_token" });
 
   const expectedPin = String(process.env.WAREHOUSE_PIN || "245811").trim();
   if (!pin || pin !== expectedPin) {
     return res.status(401).json({ ok: false, error: "invalid_pin" });
   }
+
+  // ✅ token comes from cookie (NOT from body, NOT from url)
+  const token = String(getCookie(req, "wh_token") || "").trim();
+  if (!token) {
+    return res.status(400).json({ ok: false, error: "missing_token_cookie" });
+  }
+
+  // ✅ optional: clear cookie after use (so link can't be reused easily)
+  clearCookie(res, "wh_token");
 
   const token_hash = sha256Hex(token);
 
@@ -2076,7 +2193,10 @@ async function handleWarehouseOpen(req, res) {
 
     // add Shipped tag locally (idempotent)
     const { rows: tagRows } = await client.query(
-      `select tags from tbl_order where shop_domain=$1 and order_id=$2 for update`,
+      `select tags
+       from tbl_order
+       where shop_domain=$1 and order_id=$2
+       for update`,
       [shop, orderId]
     );
 
@@ -2084,16 +2204,22 @@ async function handleWarehouseOpen(req, res) {
       const currentTags = normalizeTagsForStore(parseTags(tagRows[0].tags));
       const has = currentTags.some((t) => String(t).toLowerCase() === "shipped");
       if (!has) currentTags.push("Shipped");
+
       const tagsStr = serializeTags(normalizeTagsForStore(currentTags));
+
       await client.query(
-        `update tbl_order set tags = NULLIF($3,'') where shop_domain=$1 and order_id=$2`,
+        `update tbl_order
+         set tags = NULLIF($3,'')
+         where shop_domain=$1 and order_id=$2`,
         [shop, orderId, tagsStr]
       );
     }
 
-    // fulfill on Shopify in background
+    // fulfill on Shopify in background (don’t block)
     (async () => {
-      try { await fulfillOrderAllItems(shop, orderId); } catch { }
+      try {
+        await fulfillOrderAllItems(shop, orderId);
+      } catch { }
     })();
 
     await client.query(
@@ -2113,12 +2239,15 @@ async function handleWarehouseOpen(req, res) {
       ...bundle,
     });
   } catch (e) {
-    try { await client.query("ROLLBACK"); } catch { }
+    try {
+      await client.query("ROLLBACK");
+    } catch { }
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   } finally {
     client.release();
   }
 }
+
 
 function escHtml(s) {
   return String(s || "")
@@ -2180,8 +2309,10 @@ const server = http.createServer(async (req, res) => {
   if (setCors(req, r)) return;
 
   if (p === "/" || p === "/health") return r.status(200).send("OK");
+
   if (p === "/api/ping") return handlePing(req, r);
   if (p === "/api/webhooks/shopify") return handleWebhookShopify(req, r);
+
   if (p === "/api/orders/page") return handleOrdersPage(req, r);
   if (p === "/api/order-items") return handleOrderItems(req, r);
   if (p === "/api/orders/summary") return handleOrdersSummary(req, r);
@@ -2189,27 +2320,30 @@ const server = http.createServer(async (req, res) => {
   if (p === "/api/orders/deliver-by") return handleDeliverBy(req, r);
   if (p === "/api/orders/note-local") return handleNoteLocal(req, r);
   if (p === "/api/orders/fulfill") return handleOrdersFulfill(req, r);
+  if (p === "/api/orders/cancel") return handleOrdersCancel(req, r);
+
   if (p === "/api/inventory/import") return handleInventoryImport(req, r);
   if (p === "/api/inventory/reserve") return handleInventoryReserve(req, r);
   if (p === "/api/inventory/search") return handleInventorySearch(req, r);
   if (p === "/api/inventory/set") return handleInventorySet(req, r);
   if (p === "/api/inventory/all") return handleInventoryAll(req, r);
   if (p === "/api/inventory/note") return handleInventoryNote(req, r);
-  if (p === "/api/orders/cancel") return handleOrdersCancel(req, r);
+
   if (p === "/api/warehouse/qr") return handleWarehouseQr(req, r);
   if (p === "/api/warehouse/open") return handleWarehouseOpen(req, r);
+
   if (p.startsWith("/w/")) {
     let token = "";
-    try {
-      token = decodeURIComponent(p.slice(3) || "").trim();
-    } catch {
-      return r.status(400).send("Bad token");
-    }
-    return handleWarehousePinPage(req, r, token);
+    try { token = decodeURIComponent(p.slice(3) || "").trim(); }
+    catch { return r.status(400).send("Bad token"); }
+    return handleWarehouseTokenLanding(req, r, token);
   }
+
+  if (p === "/warehouse-scan") return handleWarehouseScanPage(req, r);
 
   return r.status(404).json({ ok: false, error: "Not Found" });
 });
+
 
 const port = process.env.PORT || 3000;
 server.listen(port, () => {
