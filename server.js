@@ -1959,13 +1959,13 @@ async function handleWarehouseQr(req, res) {
 
 // statuses we will use (no CUT/SEW)
 const WF = {
-  READY_BOX: "READY_BOX",
-  PICKUP: "PICKUP",
-  ON_WAY: "ON_WAY",
+  // READY_BOX: "READY_BOX",
+  // PICKUP: "PICKUP",
+  // ON_WAY: "ON_WAY",
   SHIPPED: "SHIPPED",
 };
 
-const WF_ORDER = [WF.READY_BOX, WF.PICKUP, WF.ON_WAY, WF.SHIPPED];
+// const WF_ORDER = [WF.READY_BOX, WF.PICKUP, WF.ON_WAY, WF.SHIPPED];
 
 function sha256Hex(s) {
   return crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
@@ -1976,15 +1976,15 @@ function newToken() {
   return crypto.randomBytes(24).toString("base64url"); // ~32 chars
 }
 
-function nextStatus(current) {
-  const cur = String(current || "").toUpperCase().trim();
-  if (!cur) return WF.READY_BOX;
+// function nextStatus(current) {
+//   const cur = String(current || "").toUpperCase().trim();
+//   if (!cur) return WF.READY_BOX;
 
-  const idx = WF_ORDER.indexOf(cur);
-  if (idx === -1) return WF.READY_BOX; // unknown -> reset to READY_BOX (safe)
-  if (idx >= WF_ORDER.length - 1) return cur; // already SHIPPED -> stay
-  return WF_ORDER[idx + 1];
-}
+//   const idx = WF_ORDER.indexOf(cur);
+//   if (idx === -1) return WF.READY_BOX; // unknown -> reset to READY_BOX (safe)
+//   if (idx >= WF_ORDER.length - 1) return cur; // already SHIPPED -> stay
+//   return WF_ORDER[idx + 1];
+// }
 
 async function getOrderBundleByShopOrder(client, shop, orderId) {
   const { rows: oRows } = await client.query(
@@ -2073,10 +2073,13 @@ async function handleWarehouseOpen(req, res) {
       [shop, orderId]
     );
 
-    const current = String(wRows?.[0]?.status || "").toUpperCase().trim();
-    const next = String(nextStatus(current)).toUpperCase().trim();
+    // const current = String(wRows?.[0]?.status || "").toUpperCase().trim();
+    // const next = String(nextStatus(current)).toUpperCase().trim();
 
-    const didAdvance = next !== current;
+    // const didAdvance = next !== current;
+    const current = String(wRows?.[0]?.status || "").toUpperCase().trim(); // may be ''
+    const next = WF.SHIPPED;
+    const didAdvance = current !== WF.SHIPPED; // if already shipped => no change
 
     // 3) update workflow ONLY if it changes (auto-advance)
     if (didAdvance) {
