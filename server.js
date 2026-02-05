@@ -2023,13 +2023,21 @@ async function getOrderBundleByShopOrder(client, shop, orderId) {
   };
 }
 async function handleWarehouseOpen(req, res) {
-  if (req.method !== "GET") {
-    res.setHeader("Allow", "GET");
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
   }
 
-  const token = String(req.query?.token || "").trim();
+  const f = await readForm(req);
+  const token = String(f.token || "").trim();
+  const pin = String(f.pin || "").trim();
+
   if (!token) return res.status(400).json({ ok: false, error: "missing_token" });
+
+  const expectedPin = String(process.env.WAREHOUSE_PIN || "245811").trim();
+  if (!pin || pin !== expectedPin) {
+    return res.status(401).json({ ok: false, error: "invalid_pin" });
+  }
 
   const token_hash = sha256Hex(token);
 
@@ -2037,7 +2045,6 @@ async function handleWarehouseOpen(req, res) {
   try {
     await client.query("BEGIN");
 
-    // 1) resolve token -> shop/order
     const { rows: tRows } = await client.query(
       `select shop_domain, order_id
        from tbl_order_qr
@@ -2054,87 +2061,46 @@ async function handleWarehouseOpen(req, res) {
     const shop = String(tRows[0].shop_domain || "").toLowerCase();
     const orderId = String(tRows[0].order_id || "").trim();
 
-    // (optional but nice) ensure order exists
-    const { rows: oOk } = await client.query(
-      `select 1 as ok from tbl_order where shop_domain=$1 and order_id=$2`,
-      [shop, orderId]
-    );
-    if (!oOk?.length) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ ok: false, error: "order_not_found" });
-    }
+    // always set shipped
+    const next = "SHIPPED";
 
-    // 2) read current workflow status (lock)
-    const { rows: wRows } = await client.query(
-      `select status
-       from tbl_order_workflow
-       where shop_domain=$1 and order_id=$2
-       for update`,
-      [shop, orderId]
+    await client.query(
+      `
+      insert into tbl_order_workflow (shop_domain, order_id, status, updated_at)
+      values ($1,$2,$3, now())
+      on conflict (shop_domain, order_id)
+      do update set status=excluded.status, updated_at=now()
+      `,
+      [shop, orderId, next]
     );
 
-    // const current = String(wRows?.[0]?.status || "").toUpperCase().trim();
-    // const next = String(nextStatus(current)).toUpperCase().trim();
+    // add Shipped tag locally (idempotent)
+    const { rows: tagRows } = await client.query(
+      `select tags from tbl_order where shop_domain=$1 and order_id=$2 for update`,
+      [shop, orderId]
+    );
 
-    // const didAdvance = next !== current;
-    const current = String(wRows?.[0]?.status || "").toUpperCase().trim(); // may be ''
-    const next = WF.SHIPPED;
-    const didAdvance = current !== WF.SHIPPED; // if already shipped => no change
-
-    // 3) update workflow ONLY if it changes (auto-advance)
-    if (didAdvance) {
+    if (tagRows?.length) {
+      const currentTags = normalizeTagsForStore(parseTags(tagRows[0].tags));
+      const has = currentTags.some((t) => String(t).toLowerCase() === "shipped");
+      if (!has) currentTags.push("Shipped");
+      const tagsStr = serializeTags(normalizeTagsForStore(currentTags));
       await client.query(
-        `
-        insert into tbl_order_workflow (shop_domain, order_id, status, updated_at)
-        values ($1,$2,$3, now())
-        on conflict (shop_domain, order_id)
-        do update set status=excluded.status, updated_at=now()
-        `,
-        [shop, orderId, next]
+        `update tbl_order set tags = NULLIF($3,'') where shop_domain=$1 and order_id=$2`,
+        [shop, orderId, tagsStr]
       );
     }
 
-    // ✅ if JUST reached SHIPPED now, mirror into tbl_order.tags and fulfill Shopify
-    if (didAdvance && next === String(WF.SHIPPED).toUpperCase()) {
-      // 1) add tag "Shipped" locally (idempotent)
-      const { rows: tagRows } = await client.query(
-        `select tags
-         from tbl_order
-         where shop_domain=$1 and order_id=$2
-         for update`,
-        [shop, orderId]
-      );
+    // fulfill on Shopify in background
+    (async () => {
+      try { await fulfillOrderAllItems(shop, orderId); } catch { }
+    })();
 
-      if (tagRows?.length) {
-        const currentTags = normalizeTagsForStore(parseTags(tagRows[0].tags));
-        const has = currentTags.some((t) => String(t).toLowerCase() === "shipped");
-        if (!has) currentTags.push("Shipped");
-
-        const tagsStr = serializeTags(normalizeTagsForStore(currentTags));
-
-        await client.query(
-          `update tbl_order
-           set tags = NULLIF($3,'')
-           where shop_domain=$1 and order_id=$2`,
-          [shop, orderId, tagsStr]
-        );
-      }
-
-      // 2) fulfill on Shopify in background (do NOT block response)
-      (async () => {
-        try {
-          await fulfillOrderAllItems(shop, orderId);
-        } catch { }
-      })();
-    }
-
-    // 4) update token last_used_at
     await client.query(
       `update tbl_order_qr set last_used_at=now() where token_hash=$1`,
       [token_hash]
     );
 
-    // 5) return order bundle (AFTER all updates)
     const bundle = await getOrderBundleByShopOrder(client, shop, orderId);
 
     await client.query("COMMIT");
@@ -2143,8 +2109,7 @@ async function handleWarehouseOpen(req, res) {
       ok: true,
       shop,
       order_id: orderId,
-      advanced_from: current || null,
-      advanced_to: next || null,
+      advanced_to: next,
       ...bundle,
     });
   } catch (e) {
@@ -2153,6 +2118,59 @@ async function handleWarehouseOpen(req, res) {
   } finally {
     client.release();
   }
+}
+
+function escHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+async function handleWarehousePinPage(req, res, token) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).send("Method Not Allowed");
+  }
+
+  const base = String(process.env.PUBLIC_API_URL || "").replace(/\/$/, "");
+  // PUBLIC_API_URL = نفس الدومين تبع السيرفر (مثال: https://shopify-proxy.onrender.com)
+  const action = `${base || ""}/api/warehouse/open`;
+
+  const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Warehouse Access</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; padding:24px; max-width:420px; margin:0 auto;}
+    .card{border:1px solid #ddd; border-radius:12px; padding:18px;}
+    input,button{width:100%; padding:12px; font-size:16px; border-radius:10px; border:1px solid #ccc;}
+    button{margin-top:10px; border:none; background:#111; color:#fff; cursor:pointer;}
+    .muted{color:#666; font-size:13px; margin-top:10px;}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Warehouse PIN</h2>
+    <p>Enter the PIN to mark this order as <b>Shipped</b>.</p>
+
+    <form method="POST" action="${escHtml(action)}">
+      <input type="hidden" name="token" value="${escHtml(token)}" />
+      <input type="password" name="pin" inputmode="numeric" pattern="[0-9]*" placeholder="PIN code" required />
+      <button type="submit">Confirm</button>
+    </form>
+
+    <div class="muted">If PIN is wrong, nothing will happen.</div>
+  </div>
+</body>
+</html>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  return res.status(200).send(html);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -2180,6 +2198,16 @@ const server = http.createServer(async (req, res) => {
   if (p === "/api/orders/cancel") return handleOrdersCancel(req, r);
   if (p === "/api/warehouse/qr") return handleWarehouseQr(req, r);
   if (p === "/api/warehouse/open") return handleWarehouseOpen(req, r);
+  if (p.startsWith("/w/")) {
+    let token = "";
+    try {
+      token = decodeURIComponent(p.slice(3) || "").trim();
+    } catch {
+      return r.status(400).send("Bad token");
+    }
+    return handleWarehousePinPage(req, r, token);
+  }
+
   return r.status(404).json({ ok: false, error: "Not Found" });
 });
 
