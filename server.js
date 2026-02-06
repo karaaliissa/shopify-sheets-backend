@@ -7,7 +7,6 @@ import crypto from "crypto";
 import getRawBody from "raw-body";
 import { pool, upsertOrderTx, replaceLineItemsTx, logWebhook } from "./db.js";
 import { verifyShopifyHmac, normalizeOrderPayload } from "./shopify.js";
-import { Readable } from "stream";
 import { fetchVariantLookup } from "./server/lib/shopifyCatalog.js";
 import { parseStockCsvStream } from "./server/lib/stockCsv.js";
 import { Transform } from "stream";
@@ -20,7 +19,7 @@ async function handleOrdersFulfill(req, res) {
   }
 
   const f = await readForm(req);
-  const shop = String(f.shop || "").toLowerCase();
+  const shop = canonicalShop(f.shop || "").toLowerCase();
   const orderId = String(f.orderId || "").trim();
   if (!shop || !orderId) {
     return res.status(400).json({ ok: false, error: "Missing shop/orderId" });
@@ -75,19 +74,39 @@ function shopifyBase(shopDomain) {
   // لازم يكون myshopify.com الأفضل
   return `https://${shopDomain}/admin/api/2024-10`;
 }
+/* ================= Shopify domain normalize ================= */
+function canonicalShop(shop) {
+  const s = String(shop || "").trim().toLowerCase();
+  if (!s) return "";
+  if (s.includes(".myshopify.com")) return s;
 
+  // if only subdomain stored: "my-store" => "my-store.myshopify.com"
+  if (!s.includes(".")) return `${s}.myshopify.com`;
+
+  // otherwise keep as-is (but ideally store myshopify.com)
+  return s;
+}
+/* ================= Fulfill all items for an order ================= */
 async function fulfillOrderAllItems(shopDomain, orderId) {
   const token = process.env.SHOPIFY_ADMIN_TOKEN;
   if (!token) throw new Error("Missing SHOPIFY_ADMIN_TOKEN");
 
+  const shop = canonicalShop(shopDomain);
+  const oid = String(orderId || "").trim();
+  if (!shop) throw new Error("Missing shop domain");
+  if (!oid) throw new Error("Missing orderId");
+
   // 1) get fulfillment_orders
-  const foUrl = `${shopifyBase(
-    shopDomain
-  )}/orders/${orderId}/fulfillment_orders.json`;
+  const foUrl = `${shopifyBase(shop)}/orders/${oid}/fulfillment_orders.json`;
   const fo = await httpsReqJson(foUrl, "GET", {
     "X-Shopify-Access-Token": token,
   });
-  if (!fo.ok) throw new Error(`Fulfillment orders fetch failed (${fo.status})`);
+
+  if (!fo.ok) {
+    throw new Error(
+      `Fulfillment orders fetch failed (${fo.status}): ${String(fo.data).slice(0, 200)}`
+    );
+  }
 
   const fos = fo.json?.fulfillment_orders || [];
   if (!fos.length) return { ok: true, message: "No fulfillment orders" };
@@ -96,13 +115,12 @@ async function fulfillOrderAllItems(shopDomain, orderId) {
   const line_items_by_fulfillment_order = fos
     .map((x) => ({
       fulfillment_order_id: x.id,
-      // fulfill ALL remaining quantities
       fulfillment_order_line_items: (x.line_items || [])
         .map((li) => ({
           id: li.id,
           quantity: li.remaining_quantity ?? li.quantity ?? 0,
         }))
-        .filter((li) => li.quantity > 0),
+        .filter((li) => Number(li.quantity) > 0),
     }))
     .filter((x) => x.fulfillment_order_line_items.length > 0);
 
@@ -111,7 +129,7 @@ async function fulfillOrderAllItems(shopDomain, orderId) {
   }
 
   // 3) create fulfillment
-  const fUrl = `${shopifyBase(shopDomain)}/fulfillments.json`;
+  const fUrl = `${shopifyBase(shop)}/fulfillments.json`;
   const payload = {
     fulfillment: {
       notify_customer: false,
@@ -125,16 +143,19 @@ async function fulfillOrderAllItems(shopDomain, orderId) {
     { "X-Shopify-Access-Token": token },
     payload
   );
+
   if (!created.ok) {
     throw new Error(
-      `Fulfillment create failed (${created.status}): ${String(
-        created.data
-      ).slice(0, 200)}`
+      `Fulfillment create failed (${created.status}): ${String(created.data).slice(0, 300)}`
     );
   }
 
-  return { ok: true, fulfillment_id: created.json?.fulfillment?.id || null };
+  return {
+    ok: true,
+    fulfillment_id: created.json?.fulfillment?.id || null,
+  };
 }
+
 async function listOrderFulfillments(shopDomain, orderId) {
   const token = process.env.SHOPIFY_ADMIN_TOKEN;
   if (!token) throw new Error("Missing SHOPIFY_ADMIN_TOKEN");
@@ -386,19 +407,9 @@ function normalizeTagsForStore(tagsArr) {
   }
   return out;
 }
-function normalizeTagName(tag) {
-  // Shopify tags are usually case-sensitive visually, بس نحنا بدنا نفس الformat عندك:
-  // "Processing, Shipped, Complete"
-  return String(tag || "").trim();
-}
-
-function joinTags(tagsArr) {
-  // keep your DB style: comma + space
-  return (tagsArr || []).filter(Boolean).join(", ");
-}
 
 async function handleOrdersSummary(req, res) {
-  const shop = String(req.query?.shop || "")
+  const shop = canonicalShop(req.query?.shop || "")
     .toLowerCase()
     .trim();
   if (!shop) return res.status(400).json({ ok: false, error: "Missing shop" });
@@ -428,6 +439,7 @@ async function readJson(req) {
     return {};
   }
 }
+/* ================= Orders tags handler ================= */
 async function handleOrdersTags(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -435,7 +447,8 @@ async function handleOrdersTags(req, res) {
   }
 
   const f = await readForm(req);
-  const shop = String(f.shop || "").toLowerCase().trim();
+  const shopInput = String(f.shop || "").toLowerCase().trim();
+  const shop = canonicalShop(shopInput);
   const orderId = String(f.orderId || "").trim();
   const action = String(f.action || "").toLowerCase().trim(); // add/remove
   const tagRaw = String(f.tag || "").trim();
@@ -458,6 +471,7 @@ async function handleOrdersTags(req, res) {
 
   try {
     await client.query("BEGIN");
+
     const { rows } = await client.query(
       `SELECT tags
        FROM tbl_order
@@ -498,20 +512,14 @@ async function handleOrdersTags(req, res) {
 
     await client.query("COMMIT");
   } catch (e) {
-    try {
-      await client.query("ROLLBACK");
-    } catch { }
-    try {
-      client.release();
-    } catch { }
+    try { await client.query("ROLLBACK"); } catch { }
+    try { client.release(); } catch { }
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   } finally {
-    try {
-      client.release();
-    } catch { }
+    try { client.release(); } catch { }
   }
 
-  // ✅ 1) LOCAL inventory deduct for Processing (do it ONCE, and return result)
+  // ✅ 1) LOCAL inventory deduct for Processing (do it ONCE)
   let invResult = null;
   if (action === "add" && normalized === "processing") {
     try {
@@ -521,59 +529,36 @@ async function handleOrdersTags(req, res) {
     }
   }
 
-  // ✅ 2) Shopify actions in background (NOT processing)
-  (async () => {
-    try {
-      const token = process.env.SHOPIFY_ADMIN_TOKEN;
-      if (!token) {
-        return;
-      }
+  // ✅ 2) Shopify results (return them so you SEE failures)
+  let shopifyResult = null;
 
+  try {
+    const token = process.env.SHOPIFY_ADMIN_TOKEN;
+    if (!token) {
+      shopifyResult = { ok: false, error: "Missing SHOPIFY_ADMIN_TOKEN" };
+    } else {
       // remove shipped => cancel fulfillments
       if (action === "remove" && normalized === "shipped") {
-        const r0 = await unfulfillOrder(shop, orderId);
-        return;
+        shopifyResult = await unfulfillOrder(shop, orderId);
       }
 
       // only add actions
-      if (action !== "add") return;
-
-      // shipped => fulfill
-      if (normalized === "shipped") {
-        try {
-          const oUrl = `${shopifyBase(shop)}/orders/${orderId}.json`;
-          const o = await httpsReqJson(oUrl, "GET", {
-            "X-Shopify-Access-Token": token,
-          });
-
-          const fStatus = String(o.json?.order?.fulfillment_status || "").toLowerCase();
-          if (fStatus === "fulfilled") {
-          } else {
-            const r1 = await fulfillOrderAllItems(shop, orderId);
-          }
-        } catch (e) {
-          const r1 = await fulfillOrderAllItems(shop, orderId);
+      if (action === "add") {
+        // shipped => fulfill
+        if (normalized === "shipped") {
+          shopifyResult = await fulfillOrderAllItems(shop, orderId);
         }
-        return;
-      }
 
-      // complete => mark paid
-      if (normalized === "complete") {
-        const oUrl = `${shopifyBase(shop)}/orders/${orderId}.json`;
-        const o = await httpsReqJson(oUrl, "GET", {
-          "X-Shopify-Access-Token": token,
-        });
-
-        const fin = String(o.json?.order?.financial_status || "").toLowerCase();
-        if (fin === "paid" || fin === "partially_paid") {
-        } else {
-          const r2 = await markOrderAsPaid(shop, orderId);
+        // complete => mark paid
+        if (normalized === "complete") {
+          shopifyResult = await markOrderAsPaid(shop, orderId);
         }
-        return;
       }
-    } catch (e) {
     }
-  })();
+  } catch (e) {
+    shopifyResult = { ok: false, error: e?.message || String(e) };
+    console.error("SHOPIFY_ACTION_FAILED", { shop, orderId, action, normalized, err: shopifyResult.error });
+  }
 
   // ✅ Response
   return res.status(200).json({
@@ -582,9 +567,11 @@ async function handleOrdersTags(req, res) {
     order_id: orderId,
     tags: nextTags,
     tags_str: tagsStr,
-    inventory: invResult, // ✅ now you see it
+    inventory: invResult,
+    shopify: shopifyResult, // ✅ now visible
   });
 }
+
 
 
 function decodeCursor(s) {
@@ -712,7 +699,7 @@ async function fetchProductImage(shopDomain, productId) {
 }
 
 async function handleOrderItems(req, res) {
-  const shop = String(req.query?.shop || "").toLowerCase();
+  const shop = canonicalShop(req.query?.shop || "").toLowerCase();
   const orderId = String(req.query?.order_id || "").trim();
   if (!shop || !orderId)
     return res.status(400).json({ ok: false, error: "Missing shop/order_id" });
@@ -746,7 +733,7 @@ async function handleDeliverBy(req, res) {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
   }
   const f = await readForm(req);
-  const shop = String(f.shop || "").toLowerCase();
+  const shop = canonicalShop(f.shop || "").toLowerCase();
   const orderId = String(f.orderId || "").trim();
   const deliverBy = String(f.deliverBy || "").trim(); // YYYY-MM-DD or ''
 
@@ -766,7 +753,7 @@ async function handleNoteLocal(req, res) {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
   }
   const f = await readForm(req);
-  const shop = String(f.shop || "").toLowerCase();
+  const shop = canonicalShop(f.shop || "").toLowerCase();
   const orderId = String(f.orderId || "").trim();
   const noteLocal = String(f.noteLocal || "").trim();
 
@@ -1027,7 +1014,6 @@ async function handleWebhookShopify(req, res) {
   }
 
   // ========================
-  // ========================
   //  D) Orders/updated webhook  ? (THIS IS THE EDIT SYNC)
   // ========================
   if (topic === "orders/updated") {
@@ -1203,7 +1189,7 @@ async function handleOrdersCancel(req, res) {
   }
 
   const f = await readForm(req);
-  const shop = String(f.shop || "").toLowerCase().trim();
+  const shop = canonicalShop(f.shop || "").toLowerCase().trim();
   const orderId = String(f.orderId || "").trim();
   const reason = String(f.reason || "customer").trim();
 
@@ -1249,7 +1235,7 @@ async function handleInventoryImport(req, res) {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
   }
 
-  const shop = String(req.query?.shop || "").toLowerCase().trim();
+  const shop = canonicalShop(req.query?.shop || "").toLowerCase().trim();
   if (!shop) {
     return res
       .status(400)
@@ -1388,7 +1374,7 @@ async function handleInventorySet(req, res) {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
   }
 
-  const shop = String(req.query?.shop || "").toLowerCase().trim(); // optional
+  const shop = canonicalShop(req.query?.shop || "").toLowerCase().trim(); // optional
   const body = await readJson(req);
 
   const variant_id = String(body?.variant_id || "").trim();
@@ -1453,7 +1439,7 @@ async function getCatalogByVariantId(shop) {
 
 async function handleInventorySearch(req, res) {
   try {
-    const shop = String(req.query?.shop || "").toLowerCase().trim();
+    const shop = canonicalShop(req.query?.shop || "").toLowerCase().trim();
     const qText = String(req.query?.q || "").trim();
     const limit = Math.min(Math.max(parseInt(req.query?.limit || "25", 10) || 25, 1), 200);
 
@@ -1615,7 +1601,7 @@ async function handleInventoryReserve(req, res) {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
   }
 
-  const shop = String(req.query?.shop || "").toLowerCase().trim();
+  const shop = canonicalShop(req.query?.shop || "").toLowerCase().trim();
   const body = await readJson(req);
 
   const orderId = String(body?.orderId || "").trim();
@@ -1801,7 +1787,7 @@ async function handleInventoryNote(req, res) {
     return res.status(405).json({ ok: false, error: "Method Not Allowed" });
   }
 
-  const shop = String(req.query?.shop || "").toLowerCase().trim(); // optional
+  const shop = canonicalShop(req.query?.shop || "").toLowerCase().trim(); // optional
   const body = await readJson(req);
 
   const variant_id = String(body?.variant_id || "").trim();
@@ -1825,7 +1811,7 @@ async function handleInventoryNote(req, res) {
 // ✅ FULL handler
 async function handleInventoryAll(req, res) {
   try {
-    const shop = String(req.query?.shop || "").toLowerCase().trim();
+    const shop = canonicalShop(req.query?.shop || "").toLowerCase().trim();
     if (!shop) return res.status(400).json({ ok: false, error: "Missing shop" });
 
     // 1) get all stock rows
@@ -1902,7 +1888,7 @@ async function handleWarehouseQr(req, res) {
   }
 
   const f = await readForm(req);
-  const shop = String(f.shop || "").toLowerCase().trim();
+  const shop = canonicalShop(f.shop || "").toLowerCase().trim();
   const orderId = String(f.orderId || "").trim();
 
   if (!shop || !orderId) {
@@ -1919,11 +1905,6 @@ async function handleWarehouseQr(req, res) {
   const client = await pool().connect();
   try {
     await client.query("BEGIN");
-
-    // if already exists, keep same token_hash (we cannot recover original token)
-    // so: if exists -> generate NEW token (simple) OR keep old and just return "already_created"
-    // We WANT to print QR, so we must return the actual token.
-    // => We'll always generate a token and store its hash (overwrite previous).
     const token = newToken();
     const token_hash = sha256Hex(token);
 
@@ -2126,6 +2107,7 @@ function getCookie(req, name) {
   return "";
 }
 
+/* ================= Warehouse scan: open & mark shipped ================= */
 async function handleWarehouseOpen(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -2140,18 +2122,21 @@ async function handleWarehouseOpen(req, res) {
     return res.status(401).json({ ok: false, error: "invalid_pin" });
   }
 
-  // ✅ token comes from cookie (NOT from body, NOT from url)
+  // ✅ token comes from cookie
   const token = String(getCookie(req, "wh_token") || "").trim();
   if (!token) {
     return res.status(400).json({ ok: false, error: "missing_token_cookie" });
   }
 
-  // ✅ optional: clear cookie after use (so link can't be reused easily)
+  // clear cookie after use
   clearCookie(res, "wh_token");
 
   const token_hash = sha256Hex(token);
 
   const client = await pool().connect();
+  let shop = "";
+  let orderId = "";
+
   try {
     await client.query("BEGIN");
 
@@ -2168,10 +2153,9 @@ async function handleWarehouseOpen(req, res) {
       return res.status(404).json({ ok: false, error: "token_not_found" });
     }
 
-    const shop = String(tRows[0].shop_domain || "").toLowerCase();
-    const orderId = String(tRows[0].order_id || "").trim();
+    shop = canonicalShop(String(tRows[0].shop_domain || ""));
+    orderId = String(tRows[0].order_id || "").trim();
 
-    // always set shipped
     const next = "SHIPPED";
 
     await client.query(
@@ -2184,7 +2168,7 @@ async function handleWarehouseOpen(req, res) {
       [shop, orderId, next]
     );
 
-    // add Shipped tag locally (idempotent)
+    // add Shipped tag locally
     const { rows: tagRows } = await client.query(
       `select tags
        from tbl_order
@@ -2208,13 +2192,6 @@ async function handleWarehouseOpen(req, res) {
       );
     }
 
-    // fulfill on Shopify in background (don’t block)
-    (async () => {
-      try {
-        await fulfillOrderAllItems(shop, orderId);
-      } catch { }
-    })();
-
     await client.query(
       `update tbl_order_qr set last_used_at=now() where token_hash=$1`,
       [token_hash]
@@ -2224,75 +2201,29 @@ async function handleWarehouseOpen(req, res) {
 
     await client.query("COMMIT");
 
+    // ✅ fulfill on Shopify (NOW we return result)
+    let shopify = null;
+    try {
+      shopify = await fulfillOrderAllItems(shop, orderId);
+    } catch (e) {
+      shopify = { ok: false, error: e?.message || String(e) };
+      console.error("QR_FULFILL_FAILED", { shop, orderId, err: shopify.error });
+    }
+
     return res.status(200).json({
       ok: true,
       shop,
       order_id: orderId,
       advanced_to: next,
+      shopify, // ✅ visible
       ...bundle,
     });
   } catch (e) {
-    try {
-      await client.query("ROLLBACK");
-    } catch { }
+    try { await client.query("ROLLBACK"); } catch { }
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   } finally {
     client.release();
   }
-}
-
-
-function escHtml(s) {
-  return String(s || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
-
-async function handleWarehousePinPage(req, res, token) {
-  if (req.method !== "GET") {
-    res.setHeader("Allow", "GET");
-    return res.status(405).send("Method Not Allowed");
-  }
-
-  const base = String(process.env.PUBLIC_API_URL || "").replace(/\/$/, "");
-  // PUBLIC_API_URL = نفس الدومين تبع السيرفر (مثال: https://shopify-proxy.onrender.com)
-  const action = `${base || ""}/api/warehouse/open`;
-
-  const html = `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Warehouse Access</title>
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; padding:24px; max-width:420px; margin:0 auto;}
-    .card{border:1px solid #ddd; border-radius:12px; padding:18px;}
-    input,button{width:100%; padding:12px; font-size:16px; border-radius:10px; border:1px solid #ccc;}
-    button{margin-top:10px; border:none; background:#111; color:#fff; cursor:pointer;}
-    .muted{color:#666; font-size:13px; margin-top:10px;}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2>Warehouse PIN</h2>
-    <p>Enter the PIN to mark this order as <b>Shipped</b>.</p>
-
-    <form method="POST" action="${escHtml(action)}">
-      <input type="hidden" name="token" value="${escHtml(token)}" />
-      <input type="password" name="pin" inputmode="numeric" pattern="[0-9]*" placeholder="PIN code" required />
-      <button type="submit">Confirm</button>
-    </form>
-
-    <div class="muted">If PIN is wrong, nothing will happen.</div>
-  </div>
-</body>
-</html>`;
-
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  return res.status(200).send(html);
 }
 
 const server = http.createServer(async (req, res) => {
